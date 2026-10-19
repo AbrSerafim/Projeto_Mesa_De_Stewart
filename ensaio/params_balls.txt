@@ -2,7 +2,33 @@ Metal:
     R = 12.61cm
     M = 8.27g
     J = 5.26e-5kgm^2
+    m = 2/5
 Laranja:
     R = 39.20cm
     M = 2.79g
     J = 2.86e-4kgm^2
+    m = 2/3
+
+a_G = (R^2 * P * S_phi(t)) / (4 * J_G + 2 * R^2 * m)
+v_G = (g / 2 / omega(t)) * (1 / (2 * m + 1)) * (C_phi0 - C_phi(t))
+
+y -> Cima
+x -> Direita
+n = y \wedge x
+phi = C^-1_(n \dot g)
+
+n = R * g
+
+R = R_y(beta) * R_x(gamma)
+
+R_y(beta) = [
+   [C_beta 0 S_beta]
+   [0 1 0]
+   [-S_beta 0 C_beta] 
+]
+
+R_x(gamma) = [
+   [1 0 0]
+   [0 C_gamma -S_gamma]
+   [0 S_gamma C_gamma] 
+]
