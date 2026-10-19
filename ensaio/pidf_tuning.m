@@ -1,0 +1,325 @@
+%% ========================================================================
+% COMPARACAO DE PIDF DISCRETO - MOTOR DC / RP2040 / FreeRTOS
+%
+% Planta identificada: PWM [%] -> posicao angular [rad]
+%                    G(s) = 4.098 / (s * (s + 8.547))
+%
+% Controle: PIDF de 2 graus de liberdade simplificado (derivada na medicao)
+%           u = Kp*(referencia - posicao) + integral - Kd*d(posicao)/dt
+%           com filtro na derivada, saturacao e anti-windup condicional.
+%
+% NAO e simulacao eletrica da ponte H nem substitui validacao experimental.
+% ========================================================================
+
+clear;
+clc;
+close all;
+
+%% ------------------------------------------------------------------------
+% 1. Planta identificada e parametros do controlador digital
+% -------------------------------------------------------------------------
+
+s = tf('s');
+G_motor_posicao = 4.098 / (s * (s + 8.547));
+
+Ts = 0.020;                  % [s] mesmo periodo inicial do firmware
+Tfinal = 12.0;                % [s] simulacao de cada degrau
+PWM_LIMIT_PERCENT = 100.0;  % [%] limites da ponte H
+
+% Opcional: zona morta aproximada, NAO estimada quantitativamente.
+% Mantenha false para avaliar inicialmente apenas saturacao e amostragem.
+SIMULATE_DEADZONE = false;
+DEADZONE_PERCENT = 10.0;
+
+% Limites iniciais de projeto (podem ser refinados apos testes reais).
+OVERSHOOT_LIMIT_PERCENT = 5.0;
+SETTLING_LIMIT_S = 1.5;
+FINAL_ERROR_LIMIT_DEG = 1.0;
+
+% Sintonias do PID Tuner informadas nos ensaios anteriores.
+% A primeira (rapida) tera Tf aumentado para respeitar a faixa digital.
+manual = [
+    struct('name','PIDF rapido - Tf 20 ms', 'Kp',49.0436, 'Ki',80.89, 'Kd',6.0266, 'Tf',0.020);
+    struct('name','PIDF lento do Tuner',  'Kp',3.6794,  'Ki',1.1435,'Kd',0.79517,'Tf',0.052092)
+];
+
+% Busca assistida por pidtune: varias frequencias de cruzamento candidatas.
+% O filtro derivativo e ajustado para pelo menos 20 ms APOS pidtune;
+% portanto as respostas precisam ser simuladas novamente.
+wc_candidates = [2, 3, 4, 5, 6, 8, 10];  % [rad/s]
+opts = pidtuneOptions('PhaseMargin', 65);
+
+candidates = manual;
+for i = 1:numel(wc_candidates)
+    wc = wc_candidates(i);
+    try
+        C = pidtune(G_motor_posicao, 'PIDF', wc, opts);
+        item.name = sprintf('pidtune wc=%g rad/s', wc);
+        item.Kp = C.Kp;
+        item.Ki = C.Ki;
+        item.Kd = C.Kd;
+        item.Tf = max(C.Tf, Ts);
+        candidates(end+1,1) = item; %#ok<SAGROW>
+    catch ME
+        warning('Nao foi possivel sintonizar wc=%.2f: %s', wc, ME.message);
+    end
+end
+
+%% ------------------------------------------------------------------------
+% 2. Discretizacao da planta por retenedor de ordem zero (ZOH)
+% -------------------------------------------------------------------------
+
+Gd = ss(c2d(G_motor_posicao, Ts, 'zoh'));
+[A,B,C,D] = ssdata(Gd);
+
+%% ------------------------------------------------------------------------
+% 3. Ensaios de degrau para todos os candidatos
+% -------------------------------------------------------------------------
+
+step_degrees = [5, 15, 30, 60];
+results = struct([]);
+
+for k = 1:numel(candidates)
+    c = candidates(k);
+    worst_over = 0;
+    worst_settle = 0;
+    worst_error = 0;
+    max_requested = 0;
+    max_applied = 0;
+    saturated_count = 0;
+    total_count = 0;
+    metrics = zeros(numel(step_degrees), 4);
+
+    for j = 1:numel(step_degrees)
+        reference = deg2rad(step_degrees(j));
+        t = (0:round(Tfinal/Ts))' * Ts;
+        r = reference * ones(size(t));
+        sim = simulate_motor_pidf(A,B,C,D,Ts,t,r,c, ...
+                                  PWM_LIMIT_PERCENT, SIMULATE_DEADZONE, DEADZONE_PERCENT);
+        m = evaluate_step(sim, reference, Ts);
+        metrics(j,:) = [m.overshoot_percent,m.settling_s,m.final_error_deg, ...
+                         max(abs(sim.u_applied))];
+        worst_over = max(worst_over,m.overshoot_percent);
+        worst_settle = max(worst_settle,m.settling_s);
+        worst_error = max(worst_error,m.final_error_deg);
+        max_requested = max(max_requested,max(abs(sim.u_raw)));
+        max_applied = max(max_applied,max(abs(sim.u_applied)));
+        saturated_count = saturated_count + sum(abs(sim.u_raw) > PWM_LIMIT_PERCENT+1e-8);
+        total_count = total_count + numel(sim.u_raw);
+    end
+
+    results(k).name = c.name; %#ok<SAGROW>
+    results(k).Kp = c.Kp;
+    results(k).Ki = c.Ki;
+    results(k).Kd = c.Kd;
+    results(k).Tf = c.Tf;
+    results(k).overshoot = worst_over;
+    results(k).settling = worst_settle;
+    results(k).error_deg = worst_error;
+    results(k).u_requested = max_requested;
+    results(k).u_applied = max_applied;
+    results(k).saturation_fraction = 100*saturated_count/total_count;
+    results(k).metrics = metrics;
+    results(k).passes = worst_over <= OVERSHOOT_LIMIT_PERCENT && ...
+                        worst_settle <= SETTLING_LIMIT_S && ...
+                        worst_error <= FINAL_ERROR_LIMIT_DEG;
+end
+
+%% ------------------------------------------------------------------------
+% 4. Ordenacao: primeiro aprovados, depois penalidades
+% -------------------------------------------------------------------------
+
+scores = zeros(numel(results),1);
+for k = 1:numel(results)
+    m = results(k);
+    scores(k) = 2*max(0,m.overshoot/OVERSHOOT_LIMIT_PERCENT-1) + ...
+                2*max(0,m.settling/SETTLING_LIMIT_S-1) + ...
+                2*max(0,m.error_deg/FINAL_ERROR_LIMIT_DEG-1) + ...
+                0.005*m.saturation_fraction + ...
+                0.05*m.settling/SETTLING_LIMIT_S;
+end
+
+passes = [results.passes]';
+[~,ix] = sortrows([~passes, scores], [1 2]);
+results = results(ix);
+
+fprintf('\n=== COMPARACAO DE CANDIDATOS ===\n');
+fprintf('Criterios: overshoot <= %.1f%%, acomodacao <= %.2f s, erro final <= %.1f graus\n', ...
+    OVERSHOOT_LIMIT_PERCENT,SETTLING_LIMIT_S,FINAL_ERROR_LIMIT_DEG);
+fprintf('OBS: saturacao permitida mas contabilizada; sem modelo validado de atrito.\n\n');
+
+names = string({results.name})';
+T_results = table(names, [results.Kp]',[results.Ki]',[results.Kd]',[results.Tf]', ...
+    [results.overshoot]', [results.settling]',[results.error_deg]', ...
+    [results.u_requested]', [results.saturation_fraction]',[results.passes]', ...
+    'VariableNames', {'Controller','Kp','Ki','Kd','Tf_s','WorstOS_pct', ...
+                      'WorstSettle_s','WorstErr_deg','PeakRawPWM_pct', ...
+                      'SaturatedSamples_pct','PassesTargets'});
+disp(T_results);
+
+best = results(1);
+PIDF_CANDIDATO = pid(best.Kp,best.Ki,best.Kd,best.Tf);
+PIDF_ESCOLHIDO = [];
+if best.passes
+    PIDF_ESCOLHIDO = PIDF_CANDIDATO;
+end
+
+fprintf('\n=== MELHOR CANDIDATO RELATIVO (AINDA NAO VALIDADO) ===\n');
+fprintf('%s\nKp=%.6f, Ki=%.6f, Kd=%.6f, Tf=%.6f s\n', ...
+    best.name,best.Kp,best.Ki,best.Kd,best.Tf);
+if ~best.passes
+    fprintf('ATENCAO: NENHUM candidato cumpriu TODAS as metas.\n');
+    fprintf('PIDF_ESCOLHIDO permanece vazio. Nao transfira os ganhos para o motor.\n');
+end
+
+%% ------------------------------------------------------------------------
+% 5. Graficos: degraus de 5, 15, 30 e 60 graus
+% -------------------------------------------------------------------------
+
+figure('Name','Degraus de posicao - melhor candidato');
+% subplot e compativel com versoes mais antigas do MATLAB.
+
+for j = 1:numel(step_degrees)
+    t = (0:round(Tfinal/Ts))' * Ts;
+    r = deg2rad(step_degrees(j)) * ones(size(t));
+    sim = simulate_motor_pidf(A,B,C,D,Ts,t,r,best, ...
+                              PWM_LIMIT_PERCENT,SIMULATE_DEADZONE,DEADZONE_PERCENT);
+
+    subplot(numel(step_degrees),2,2*j-1);
+    plot(t,rad2deg(sim.theta),'LineWidth',1.4);
+    hold on;
+    plot(t,step_degrees(j)*ones(size(t)),'--k');
+    ylabel(sprintf('Posicao %d°',step_degrees(j)));
+    grid on;
+
+    subplot(numel(step_degrees),2,2*j);
+    stairs(t,sim.u_applied,'LineWidth',1.2);
+    hold on;
+    plot(t,100*ones(size(t)),'--r');
+    plot(t,-100*ones(size(t)),'--r');
+    ylabel('PWM [%]');
+    grid on;
+end
+xlabel('Tempo [s]');
+
+%% ------------------------------------------------------------------------
+% 6. Graficos: reversoes de referencia angular
+% -------------------------------------------------------------------------
+
+Trev = 8;
+t = (0:round(Trev/Ts))' * Ts;
+r = zeros(size(t));
+r(t >= 1 & t < 3) = deg2rad(30);
+r(t >= 3 & t < 5) = deg2rad(-30);
+r(t >= 5 & t < 7) = deg2rad(15);
+r(t >= 7) = 0;
+
+sim_rev = simulate_motor_pidf(A,B,C,D,Ts,t,r,best, ...
+                               PWM_LIMIT_PERCENT,SIMULATE_DEADZONE,DEADZONE_PERCENT);
+
+figure('Name','Reversoes de posicao - melhor candidato');
+subplot(2,1,1);
+plot(t,rad2deg(sim_rev.theta),'LineWidth',1.5);
+hold on;
+stairs(t,rad2deg(r),'--k','LineWidth',1.0);
+ylabel('Posicao [graus]');
+legend('Medida simulada','Referencia','Location','best');
+grid on;
+
+subplot(2,1,2);
+stairs(t,sim_rev.u_applied,'LineWidth',1.3);
+hold on;
+plot(t,100*ones(size(t)),'--r');
+plot(t,-100*ones(size(t)),'--r');
+ylabel('PWM [%]');
+xlabel('Tempo [s]');
+grid on;
+
+%% ------------------------------------------------------------------------
+% 7. Variaveis no workspace para analise posterior
+% -------------------------------------------------------------------------
+
+G_MOTOR_POSICAO_DISCRETO = Gd;
+RESULTADOS_PIDF = T_results;
+SIMULACAO_REVERSOES = sim_rev;
+
+fprintf('\nVariaveis criadas: PIDF_CANDIDATO, PIDF_ESCOLHIDO, RESULTADOS_PIDF, G_MOTOR_POSICAO_DISCRETO.\n');
+fprintf('Confira graficos e limites antes de transferir ganhos para FreeRTOS.\n');
+
+%% ========================================================================
+% FUNCOES LOCAIS
+% ========================================================================
+
+function out = simulate_motor_pidf(A,B,C,D,Ts,t,r,c,limit,with_deadzone,deadzone)
+% Simula a planta ZOH com controle PIDF digital e integracao condicional.
+% Na amostra k: mede theta(k), calcula PWM(k), atualiza planta ate k+1.
+
+    n = numel(t);
+    x = zeros(size(A,1),1);
+    I = 0;
+    filtered_speed = 0;
+    previous_theta = 0;
+
+    out.theta = zeros(n,1);
+    out.u_raw = zeros(n,1);
+    out.u_applied = zeros(n,1);
+    out.reference = r;
+    out.time = t;
+
+    alpha = exp(-Ts/max(c.Tf,1e-6));
+
+    for k = 1:n
+        theta_k = C*x;  % D ~= 0 apenas para modelos nao estritamente proprios
+        if k > 1
+            % Velocidade numerica, filtrada no mesmo periodo do controlador.
+            raw_speed = (theta_k - previous_theta)/Ts;
+            filtered_speed = alpha*filtered_speed + (1-alpha)*raw_speed;
+        end
+        previous_theta = theta_k;
+
+        error = r(k) - theta_k;
+        pre = c.Kp*error + I - c.Kd*filtered_speed;
+
+        % Anti-windup condicional; permite integrar para sair da saturacao.
+        may_integrate = (pre >= -limit && pre <= limit) || ...
+                        (pre > limit && error < 0) || ...
+                        (pre < -limit && error > 0);
+        if may_integrate
+            I = I + c.Ki*Ts*error;
+        end
+
+        requested = c.Kp*error + I - c.Kd*filtered_speed;
+        applied = min(max(requested,-limit),limit);
+
+        if with_deadzone && abs(applied) < deadzone
+            applied = 0;
+        end
+
+        out.theta(k) = theta_k;
+        out.u_raw(k) = requested;
+        out.u_applied(k) = applied;
+
+        % Aplicacao do PWM e evolucao da planta ate a amostra seguinte.
+        x = A*x + B*applied;
+    end
+end
+
+function m = evaluate_step(sim,reference,Ts)
+% Overshoot e acomodacao com referencia conhecida; tolerancia em graus.
+    theta = sim.theta;
+    ref_abs = abs(reference);
+    aligned = sign(reference)*theta;
+    m.overshoot_percent = 100*max(0,(max(aligned)-ref_abs)/ref_abs);
+
+    % Acomodacao: erro <= max(2% do degrau, 0.5 grau) ate o fim.
+    tol = max(0.02*ref_abs,deg2rad(0.5));
+    bad = find(abs(theta-reference) > tol);
+    if isempty(bad)
+        m.settling_s = 0;
+    elseif bad(end) == numel(theta)
+        m.settling_s = Inf;
+    else
+        m.settling_s = bad(end)*Ts;
+    end
+    m.final_error_deg = rad2deg(abs(theta(end)-reference));
+end

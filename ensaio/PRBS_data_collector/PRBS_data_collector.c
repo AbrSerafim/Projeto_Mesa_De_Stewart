@@ -37,7 +37,7 @@
 #define MOTOR_PWM_CLOCK_DIV 1.0f
 
 /* Amostragem: 20 ms = 50 Hz; 4000 amostras = 80 segundos de memoria. */
-#define SAMPLE_PERIOD_MS 20u
+#define SAMPLE_PERIOD_MS 20u //<-------------
 #define MAX_SAMPLES 4000u
 #define START_DELAY_MS 2000u
 #define DUMP_DELAY_MS 1000u
