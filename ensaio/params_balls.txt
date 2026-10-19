@@ -1,0 +1,8 @@
+Metal:
+    R = 12.61cm
+    M = 8.27g
+    J = 5.26e-5kgm^2
+Laranja:
+    R = 39.20cm
+    M = 2.79g
+    J = 2.86e-4kgm^2
