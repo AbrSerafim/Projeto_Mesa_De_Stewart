@@ -48,11 +48,10 @@
 #define SIGNAL_PRBS 3u
 #define SIGNAL_MULTISINE 4u
 #define SIGNAL_CHIRP 5u
-#define SIGNAL_FILTERED_RANDOM 6u
-#define SIGNAL_RANDOM_MULTILEVEL 7u
+//#define SIGNAL_FILTERED_RANDOM 6u
+//#define SIGNAL_RANDOM_MULTILEVEL 7u
 #define SIGNAL_BIPOLAR_MULTILEVEL 8u
 #define EXPERIMENT_SIGNAL SIGNAL_BIPOLAR_MULTILEVEL
-
 /* Modo 0 = coleta em RAM e imprime ao final (recomendado).
  * Modo 1 = imprime enquanto ensaia; pode prejudicar o determinismo. */
 #define OUTPUT_BUFFERED_CSV 0u
