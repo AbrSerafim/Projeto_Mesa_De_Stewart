@@ -1,3 +1,5 @@
+""" Class to measure processes time """
+
 import time 
 from contextlib import contextmanager
 

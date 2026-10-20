@@ -1,3 +1,5 @@
+""" Code to a process time """
+
 from Timer import PipelineTimer
 
 timer = PipelineTimer()

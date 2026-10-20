@@ -38,7 +38,7 @@
 
 /* Amostragem */
 #define SAMPLE_PERIOD_MS 2u //<-------------
-#define MAX_SAMPLES 4000u
+#define MAX_SAMPLES 15000u
 #define START_DELAY_MS 2000u
 #define DUMP_DELAY_MS 1000u
 

@@ -17,7 +17,7 @@ close all;
 % 1. Importacao dos dados exportados pela Raspberry Pi Pico
 % -------------------------------------------------------------------------
 
-filename = 'C:\Users\herog\vscode\micro\Projeto_Mesa_De_Stewart\ensaio\dados_motor1.txt';
+filename = 'C:\Users\herog\vscode\micro\Projeto_Mesa_De_Stewart\ensaio\dados_motor2_2_15000.txt';
 
 fid = fopen(filename, 'r');
 
