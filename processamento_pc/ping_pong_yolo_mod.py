@@ -9,7 +9,7 @@ from pathlib import Path
 # Config
 # =========================
 
-MODEL_PATH = Path(r"./yolo26n.engine")
+MODEL_PATH = Path(r"yolo26n.pt")
 CONF = .5
 
 CAMERA_ID = 1
