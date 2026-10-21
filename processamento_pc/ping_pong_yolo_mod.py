@@ -6,11 +6,13 @@ import numpy as np
 from pathlib import Path
 
 # =========================
-# CONFIG
+# Config
 # =========================
 
-MODEL_PATH = Path(r"./yolo26n.pt")
+MODEL_PATH = Path(r"./yolo26n.engine")
 CONF = .5
+
+CAMERA_ID = 1
 
 # =========================
 # Functions & Classes
@@ -26,7 +28,7 @@ def setup(model_path: Path = MODEL_PATH) -> None:
 
     # Tries to open the cam
     global cap
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(CAMERA_ID)
     if not cap.isOpened():
         cap.release()
         raise RuntimeError("Failed to open a webcam")
@@ -56,6 +58,8 @@ def extract_result(results):
         return boxes.xyxy[best_idx].numpy()
 
 def process_result(bbox):
+    if bbox is None:
+        return 
     # Extract bbox corners
     x1, y1, x2, y2 = bbox
 
@@ -72,58 +76,64 @@ def process_result(bbox):
     return x1, y1, x2, y2, xc, yc
 
 def draw(box, frame):
-    x1, y1, x2, y2, xc, yc = box
-
-    cv2.rectangle(
-        frame,
-        (x1, y1),
-        (x2, y2),
-        (0, 255, 0),
-        2
-        )
-
-    cv2.circle(
-        frame,
-        (xc, yc),
-        5,
-        (0, 0, 255),
-        -1
-               )
-
-    cv2.putText(
-        frame,
-        f"Centro: ({xc}, {yc})",
-        (xc + 10, yc),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-
-    cv2.putText(
-    frame,
-    f"Anterior: {last_points[0]}",
-    (10, 30),
-    cv2.FONT_HERSHEY_SIMPLEX,
-    0.6,
-    (255, 255, 255),
-    2
-    )
-
-    cv2.putText(
-        frame,
-        f"Atual: {last_points[1]}",
-        (10, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-
-    cv2.imshow(
+    if box is None:
+        cv2.imshow(
         "Deteccao da bolinha",
         frame
     )
+    else:
+        x1, y1, x2, y2, xc, yc = box
+
+        cv2.rectangle(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            (0, 255, 0),
+            2
+            )
+
+        cv2.circle(
+            frame,
+            (xc, yc),
+            5,
+            (0, 0, 255),
+            -1
+                )
+
+        cv2.putText(
+            frame,
+            f"Centro: ({xc}, {yc})",
+            (xc + 10, yc),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2
+        )
+
+        cv2.putText(
+        frame,
+        f"Anterior: {last_points[0]}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2
+        )
+
+        cv2.putText(
+            frame,
+            f"Atual: {last_points[1]}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2
+        )
+
+        cv2.imshow(
+            "Deteccao da bolinha",
+            frame
+        )
 
 def close():
     cap.release()

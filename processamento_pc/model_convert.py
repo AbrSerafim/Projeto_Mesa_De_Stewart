@@ -7,7 +7,7 @@ from ultralytics import YOLO
 # CONFIGURATION
 # ============================================================
 
-MODEL_PATH = Path("best.pt")  # Path to your trained YOLO model
+MODEL_PATH = Path("yolo26n.engine")  # Path to your trained YOLO model
 IMAGE_SIZE = 640              # Input image size: 640x640
 DEVICE = 0                    # First NVIDIA GPU
 HALF = True                   # Use FP16 for TensorRT
@@ -29,7 +29,6 @@ onnx_path = model.export(
     format="onnx",
     imgsz=IMAGE_SIZE,
     device=DEVICE,
-    half=HALF,
     dynamic=False,
 )
 
@@ -43,7 +42,6 @@ engine_path = model.export(
     format="engine",
     imgsz=IMAGE_SIZE,
     device=DEVICE,
-    half=HALF,
     dynamic=False,
     workspace=8,
 )
