@@ -156,8 +156,8 @@ while True:
         frame
     )
 
-    # ESC para sair
-    if cv2.waitKey(1) & 0xFF == 27:
+    # ESC/q/Q para sair
+    if cv2.waitKey(1) & 0xFF in (27, ord('q'), ord('Q')) :
         break
 
 
