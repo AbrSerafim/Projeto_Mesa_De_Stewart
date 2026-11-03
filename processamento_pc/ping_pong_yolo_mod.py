@@ -12,15 +12,15 @@ from pathlib import Path
 MODEL_PATH = Path(r"yolo26n.pt")
 CONF = .5
 
-CAMERA_ID = 1
+CAMERA_ID = 0
 
 # =========================
 # Functions & Classes
 # =========================
 
-def setup(model_path: Path = MODEL_PATH) -> None:
-    if not model_path.exists():
-        raise FileNotFoundError("Model path does not exists")
+def setup(model_path: Path = MODEL_PATH, camera_id: int = CAMERA_ID) -> None:
+#   if not model_path.exists():
+#       raise FileNotFoundError("Model path does not exists")
 
     # Load yolo
     global model
@@ -28,7 +28,7 @@ def setup(model_path: Path = MODEL_PATH) -> None:
 
     # Tries to open the cam
     global cap
-    cap = cv2.VideoCapture(CAMERA_ID)
+    cap = cv2.VideoCapture(camera_id)
     if not cap.isOpened():
         cap.release()
         raise RuntimeError("Failed to open a webcam")

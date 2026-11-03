@@ -8,10 +8,12 @@ import ping_pong_opencv_mod as ppc
 
 timer = PipelineTimer()
 
-MODE = "opencv" # "yolo" || "opencv"
+MODE = "yolo" # "yolo" || "opencv"
+
+CAMERA_ID = 0
 
 if MODE == "yolo":
-    ppy.setup()
+    ppy.setup(camera_id=CAMERA_ID)
 
     while True:
 
@@ -42,7 +44,7 @@ if MODE == "yolo":
     timer.report()
 
 elif MODE == "opencv":
-    ppc.setup()
+    ppc.setup(camera_id=CAMERA_ID)
 
     while True:
 

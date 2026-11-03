@@ -21,10 +21,10 @@ MIN_AREA = 100
 # Functions & Classes
 # =========================
 
-def setup() -> None:
+def setup(camera_id: int = CAMERA_ID) -> None:
     # Tries to open the cam
     global cap
-    cap = cv2.VideoCapture(CAMERA_ID)
+    cap = cv2.VideoCapture(camera_id)
     if not cap.isOpened():
         cap.release()
         raise RuntimeError("Failed to open a webcam")

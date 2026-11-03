@@ -22,4 +22,5 @@ G3z_0 = c2d(G3_0, Ts, 'zoh');
 G3_1 = tf([.01359 4.554], [1 9.727]); % 88.40%
 G3z_1 = c2d(G3_1, Ts, 'zoh');
 
-pidTuner()
+%pidTuner()
+sisotool();

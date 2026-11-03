@@ -1,0 +1,10 @@
+%% Iterações para os ganhos do pidf
+34 - 37; parametros resposta segunda ordem
+41 - 44; ganhos pra tipos de resposta (????)
+49 - 66; busca pelos ganhos ideais
+
+%% Discretização para espaço de estados
+68 - 74; ^^^^^^
+
+%% Calculo de métricas
+75 - 174; ^^^^^^
