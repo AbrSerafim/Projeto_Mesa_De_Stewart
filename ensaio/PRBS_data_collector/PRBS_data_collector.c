@@ -11,7 +11,7 @@
 
 #include "FreeRTOS.h"
 #include "task.h"
-
+// teste
 /* -------------------------------------------------------------------------- */
 /* Configuracao do ensaio, hardware e temporizacao.                            */
 /* -------------------------------------------------------------------------- */
@@ -25,11 +25,25 @@
 #define MOTOR_IN1_GPIO 2u
 #define MOTOR_IN2_GPIO 3u
 
-/* Encoder incremental: duas bordas de A; B fornece o sentido (x2). */
+/* Encoder incremental em quadratura */
 #define ENCODER_A_GPIO 6u
 #define ENCODER_B_GPIO 7u
-#define ENCODER_COUNTS_PER_OUTPUT_REV 640.0f
-#define ENCODER_SIGN 1                         /* Troque para -1 se necessario. */
+
+// #define ENCODER_CPR_MOTOR 64.0f
+// #define ENCODER_DECODE_FACTOR 4.0f
+// #define GEAR_RATIO 102.08f
+
+#define ENCODER_COUNTS_PER_MOTOR_REV 1200.0f
+#define GEAR_RATIO 102.08f
+
+#define ENCODER_COUNTS_PER_OUTPUT_REV \
+    (ENCODER_COUNTS_PER_MOTOR_REV * GEAR_RATIO)
+
+
+// #define ENCODER_COUNTS_PER_OUTPUT_REV \
+//     (ENCODER_CPR_MOTOR * ENCODER_DECODE_FACTOR * GEAR_RATIO)
+
+#define ENCODER_SIGN 1                   /* Troque para -1 se necessario. */
 
 /* Ajuste o sinal ao limite seguro do conjunto motor + fonte + carga. */
 #define PWM_LIMIT_PERCENT 100.0f
@@ -52,12 +66,11 @@
 #define SIGNAL_RANDOM_MULTILEVEL 7u
 #define SIGNAL_BIPOLAR_MULTILEVEL 8u
 #define EXPERIMENT_SIGNAL SIGNAL_BIPOLAR_MULTILEVEL
-
 /* Modo 0 = coleta em RAM e imprime ao final (recomendado).
  * Modo 1 = imprime enquanto ensaia; pode prejudicar o determinismo. */
 #define OUTPUT_BUFFERED_CSV 0u
 #define OUTPUT_LIVE_MUINO 1u
-#define OUTPUT_MODE OUTPUT_BUFFERED_CSV
+#define OUTPUT_MODE OUTPUT_LIVE_MUINO
 
 /* Perfil temporal; todas as frequencias em Hz. */
 #define EXPERIMENT_DURATION_MS 30000u
@@ -106,6 +119,8 @@ static int32_t g_encoder_position = 0;
 static uint32_t g_encoder_ready = 0u;
 static uint32_t g_experiment_finished = 0u;
 static uint32_t g_encoder_edges = 0u;
+ /* Estado anterior dos canais A e B */
+static uint8_t g_encoder_prev_state = 0u;
 
 /* -------------------------------------------------------------------------- */
 /* PWM bidirecional.                                                          */
@@ -148,6 +163,66 @@ static void motor_set_signed_duty_percent(float duty_percent)
     }
 }
 
+
+
+static void encoder_monitor_task(void *parameters)
+{
+    (void)parameters;
+
+    while (__atomic_load_n(&g_encoder_ready, __ATOMIC_ACQUIRE) == 0u) {
+        vTaskDelay(pdMS_TO_TICKS(10u));
+    }
+
+    int32_t previous_count =
+        __atomic_load_n(&g_encoder_position, __ATOMIC_RELAXED);
+
+    uint64_t previous_time = time_us_64();
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500u));
+
+        const uint64_t current_time = time_us_64();
+
+        const int32_t current_count =
+            __atomic_load_n(&g_encoder_position, __ATOMIC_RELAXED);
+
+        const int32_t delta_count = current_count - previous_count;
+
+        const uint32_t delta_time_us =
+            (uint32_t)(current_time - previous_time);
+
+
+        const float angle_rad =
+            (float)g_encoder_position *
+            TWO_PI /
+            ENCODER_COUNTS_PER_OUTPUT_REV;
+        // const float angle_rad =
+        //     (float)current_count * TWO_PI /
+        //     ENCODER_COUNTS_PER_OUTPUT_REV;
+
+         float rpm = 0.0f;
+
+        if (delta_time_us > 0u) {
+            rpm = ((float)delta_count * 60000000.0f) /
+                (ENCODER_COUNTS_PER_OUTPUT_REV *
+                 (float)delta_time_us);
+        }
+
+        printf(
+            "Count: %ld | Delta: %ld | Angle: %.4f rad | RPM: %.2f\n",
+            (long)current_count,
+            (long)delta_count,
+            (double)angle_rad,
+            (double)rpm
+        );
+
+        previous_count = current_count;
+        previous_time = current_time;
+    }
+}
+
+
+
 static void motor_outputs_init(void)
 {
     gpio_set_function(MOTOR_IN1_GPIO, GPIO_FUNC_PWM);
@@ -176,21 +251,57 @@ static void motor_outputs_init(void)
 /* Encoder: interrupcao e tarefa presas ao core 1.                             */
 /* -------------------------------------------------------------------------- */
 
+
+
+/* Tabela de decodificação */
+static const int8_t encoder_quadrature_table[16] = {
+     0, +1, -1,  0,
+    -1,  0,  0, +1,
+    +1,  0,  0, -1,
+     0, -1, +1,  0
+};
+
+/* Callback do encoder */
 static void encoder_gpio_callback(uint gpio, uint32_t events)
 {
-    if ((gpio != ENCODER_A_GPIO) ||
-        ((events & (GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL)) == 0u)) {
+    if ((gpio != ENCODER_A_GPIO) &&
+        (gpio != ENCODER_B_GPIO)) {
         return;
     }
 
-    const bool phase_a = gpio_get(ENCODER_A_GPIO);
-    const bool phase_b = gpio_get(ENCODER_B_GPIO);
-    const int32_t direction = ((phase_a == phase_b) ? 1 : -1) * ENCODER_SIGN;
+    if ((events & (GPIO_IRQ_EDGE_RISE |
+                   GPIO_IRQ_EDGE_FALL)) == 0u) {
+        return;
+    }
 
-    __atomic_fetch_add(&g_encoder_position, direction, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&g_encoder_edges, 1u, __ATOMIC_RELAXED);
+    const uint8_t phase_a = (uint8_t)gpio_get(ENCODER_A_GPIO);
+    const uint8_t phase_b = (uint8_t)gpio_get(ENCODER_B_GPIO);
+
+    const uint8_t current_state =
+        (uint8_t)((phase_a << 1) | phase_b);
+
+    const uint8_t index =
+        (uint8_t)((g_encoder_prev_state << 2) | current_state);
+
+    const int8_t direction =
+        encoder_quadrature_table[index];
+
+    if (direction != 0) {
+        __atomic_fetch_add(
+            &g_encoder_position,
+            (int32_t)direction * ENCODER_SIGN,
+            __ATOMIC_RELAXED
+        );
+
+        __atomic_fetch_add(
+            &g_encoder_edges,
+            1u,
+            __ATOMIC_RELAXED
+        );
+    }
+
+    g_encoder_prev_state = current_state;
 }
-
 static void encoder_task(void *parameters)
 {
     (void)parameters;
@@ -203,14 +314,33 @@ static void encoder_task(void *parameters)
     gpio_set_dir(ENCODER_B_GPIO, GPIO_IN);
     gpio_pull_up(ENCODER_B_GPIO);
 
-    /* A API registra a callback no nucleo que a executa: core 1. */
+    /* Estado inicial da quadratura */
+    const uint8_t phase_a = (uint8_t)gpio_get(ENCODER_A_GPIO);
+    const uint8_t phase_b = (uint8_t)gpio_get(ENCODER_B_GPIO);
+
+    g_encoder_prev_state =
+        (uint8_t)((phase_a << 1) | phase_b);
+
+    /* Canal A */
     gpio_set_irq_enabled_with_callback(
         ENCODER_A_GPIO,
         GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
         true,
-        encoder_gpio_callback);
+        encoder_gpio_callback
+    );
 
-    __atomic_store_n(&g_encoder_ready, 1u, __ATOMIC_RELEASE);
+    /* Canal B */
+    gpio_set_irq_enabled(
+        ENCODER_B_GPIO,
+        GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
+        true
+    );
+
+    __atomic_store_n(
+        &g_encoder_ready,
+        1u,
+        __ATOMIC_RELEASE
+    );
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000u));
@@ -533,6 +663,48 @@ static void telemetry_task(void *parameters)
 
 int main(void)
 {
+    // stdio_init_all();
+
+    // sleep_ms(3000);
+
+    // /* Inicializa PWM, mantendo os dois sinais em zero */
+    // motor_outputs_init();
+
+    // if (xTaskCreateAffinitySet(
+    //         encoder_task,
+    //         "encoder_core1",
+    //         256,
+    //         NULL,
+    //         tskIDLE_PRIORITY + 3,
+    //         CORE_1_AFFINITY_MASK,
+    //         NULL) != pdPASS ||
+
+    //     xTaskCreateAffinitySet(
+    //         encoder_monitor_task,
+    //         "encoder_monitor",
+    //         512,
+    //         NULL,
+    //         tskIDLE_PRIORITY + 2,
+    //         CORE_0_AFFINITY_MASK,
+    //         NULL) != pdPASS) {
+
+    //     motor_set_signed_duty_percent(0.0f);
+
+    //     for (;;) {
+    //         tight_loop_contents();
+    //     }
+    // }
+
+    // vTaskStartScheduler();
+
+    // motor_set_signed_duty_percent(0.0f);
+
+    // for (;;) {
+    //     tight_loop_contents();
+    // }
+
+
+
     stdio_init_all();
 
     sleep_ms(3000);
