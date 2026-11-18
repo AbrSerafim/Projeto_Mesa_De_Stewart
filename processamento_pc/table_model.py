@@ -7,7 +7,7 @@ from math import atan, ceil, floor, pi
 
 class Table_Model():
     """ Class to handle the table model params """
-    def __init__(self, lengths: list[float], ang: float, input_angle: float = 0.0) -> None:
+    def __init__(self, lengths: list[float], ang: float,  theta_0: float = 0.0, theta_1: float = 0.0) -> None:
 
         if len(lengths) != 6:
             raise ValueError("Expected 6 linkage lengths")
@@ -19,16 +19,18 @@ class Table_Model():
 
         self.ang = ang # Fixed angle between motor and pivot
 
-        self.input = input_angle # Input angle
+        self.theta_0 = theta_0 # Output angle
+        self.theta_1 = theta_1 # Input angle
 
         self.calculate_constants()
-        self.calculate_coefficients()
+        self.calculate_coefficients_1()
 
-    def update(self, input_angle: float):
+    def update(self, theta_1: float):
         """ Update input and recalculate coefficients """
 
-        self.input = input_angle
-        self.calculate_coefficients()
+        self.theta_1 = theta_1
+        self.theta_0 = self.theta_0
+        self.calculate_coefficients_0()
 
     def calculate_constants(self) -> None:
         """ Coefficients to solve for input angle """
@@ -51,26 +53,53 @@ class Table_Model():
         self.cos = np.cos(self.ang)
         self.sin = np.sin(self.ang)
 
-    def calculate_coefficients(self) -> None:
-        """ Calculate input-dependent quartic coefficients """
-        self.b = self.B
-        self.c = self.C
-        self.f = (self.E - self.G) * self.cos - self.H * np.cos(self.input) + self.J * np.sin(self.input)
-        self.g = -self.F * self.sin - self.G * self.cos + self.I * np.sin(self.input) + self.J * np.cos(self.input)
-        self.h = self.L - self.K
-        self.d = self.A - 1.0 - self.D * np.cos(self.ang - self.input)
+    def calculate_coefficients_0(self) -> None:
+        """ Calculate theta_1-dependent quartic coefficients """
+        self.b_0 = self.B
+        self.c_0 = self.C
+        self.f_0 = (self.E - self.G) * self.cos - self.H * np.cos(self.theta_1) + self.J * np.sin(self.theta_1)
+        self.g_0 = -self.F * self.sin - self.G * self.cos + self.I * np.sin(self.theta_1) + self.J * np.cos(self.theta_1)
+        self.h_0 = self.L - self.K
+        self.d_0 = self.A - 1.0 - self.D * np.cos(self.ang - self.theta_1)
 
-    def solve_theta(self, theta_range=(-pi, pi), tol: float=1e-9) -> list[float]:
+    def calculate_coefficients_1(self) -> None:
+        """ Calculate theta_1-dependent quartic coefficients """
+
+        self.a_1 = -self.D * self.cos - self.H + self.J * np.sin(self.theta_0)
+        self.b_1 = -self.D * self.sin + self.I * np.sin(self.sin) + self.J * np.sin(self.sin)
+        self.c_1 = self.A - 1.0 + self.B * (np.cos(self.theta_0))**2 + self.C * (np.sin(self.theta_0))**2 + self.E * self.cos * np.cos(self.theta_0)
+        self.c_1 += -self.F * self.sin * np.sin(self.theta_0) - self.G * (np.sin(self.ang + self.theta_0)) + (self.L - self.K) * np.sin(2*self.theta_0) / 2
+
+    def solve_theta_1(self, theta_range=(-pi, pi), tol: float=1e-9) -> list[float]:
         """ Solve inverse kinematics for valid theta values """
 
         theta_min, theta_max = theta_range
 
+        d = self.a_1**2 + self.b_1**2 - self.c_1**2
+
+        if d < 0:
+            raise ValueError("Impossible to solve, imaginary roots")
+
+        sines = [
+            (-self.b_1*self.c_1 + self.a_1*(d)**.5)/(self.a_1**2+self.b_1**2),
+            (-self.b_1*self.c_1 - self.a_1*(d)**.5)/(self.a_1**2+self.b_1**2),
+                 ]
+
+        roots = [np.asin(sine) for sine in sines]
+
+        return roots
+
+    def solve_theta_0(self, theta_range=(-pi, pi), tol: float=1e-9) -> list[float]:
+        """ Solve direct kinematics for valid theta values """
+
+        theta_min, theta_max = theta_range
+
         coeffs = np.array([
-            self.b - self.f + self.d,
-            2*(self.g - self.h),
-            -2*self.b + 4*self.c + 2*self.d,
-            2*(self.g + self.h),
-            self.b + self.f + self.d
+            self.b_0 - self.f_0 + self.d_0,
+            2*(self.g_0 - self.h_0),
+            -2*self.b_0 + 4*self.c_0 + 2*self.d_0,
+            2*(self.g_0 + self.h_0),
+            self.b_0 + self.f_0 + self.d_0
         ], dtype=float)
 
         scale = np.max(np.abs(coeffs))
