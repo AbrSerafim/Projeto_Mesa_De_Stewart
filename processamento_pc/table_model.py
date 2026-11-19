@@ -65,8 +65,8 @@ class Table_Model():
             raise ValueError("Impossible to solve, imaginary roots")
 
         sines = [
-            (-self.P*self.R + self.Q*(d)**.5)/(self.Q**2+self.P**2),
-            (-self.P*self.R - self.Q*(d)**.5)/(self.Q**2+self.P**2),
+            (-self.Q*self.R + self.P*(d)**.5)/(self.Q**2+self.P**2),
+            (-self.Q*self.R - self.P*(d)**.5)/(self.Q**2+self.P**2),
                  ]
 
         roots = [np.asin(sine) for sine in sines]
