@@ -3,11 +3,11 @@
 import sympy as sp
 import numpy as np
 
-from math import atan, ceil, floor, pi
+from math import pi
 
-class Table_Model():
-    """ Class to handle the table model params """
-    def __init__(self, lengths: list[float], ang: float,  theta_0: float = 0.0, theta_1: float = 0.0) -> None:
+class Motor_table_model():
+    """ Class to handle the motor to table model params """
+    def __init__(self, lengths: list[float], ang: float,  theta_0: float = pi, theta_1: float = 0.0) -> None:
 
         if len(lengths) != 6:
             raise ValueError("Expected 6 linkage lengths")
@@ -27,12 +27,12 @@ class Table_Model():
 
         self.calculate_coefficients()
 
-    def update(self, theta_1: float):
+    def update(self, theta_0: float):
         """ Update input and recalculate coefficients """
 
-        self.theta_1 = theta_1
-        self.theta_0 = self.theta_0
+        self.theta_0 = theta_0
         self.calculate_coefficients()
+        self.theta_1 = self.solve_theta_1()
 
     def calculate_coefficients(self) -> None:
         """ Calculate theta_0-dependent coefficients """
@@ -54,24 +54,24 @@ class Table_Model():
             +2*self.l*self.l4*self.sin*np.cos(self.theta_0) + 2*self.l*self.l5*self.sin*np.sin(self.theta_0)
         )
 
-    def solve_theta_1(self, theta_range=(-pi, pi), tol: float=1e-9) -> list[float]:
+    def solve_theta_1(self, tol: float=1e-9) -> list[float]:
         """ Solve inverse kinematics for valid theta values """
-
-        theta_min, theta_max = theta_range
 
         d = self.Q**2 + self.P**2 - self.R**2
 
-        if d < 0:
+        if d < -tol:
             raise ValueError("Impossible to solve, imaginary roots")
 
         sines = [
-            (-self.Q*self.R + self.P*(d)**.5)/(self.Q**2+self.P**2),
-            (-self.Q*self.R - self.P*(d)**.5)/(self.Q**2+self.P**2),
+            (-self.Q*self.R + self.P*np.sqrt(d))/(self.Q**2+self.P**2),
+            (-self.Q*self.R - self.P*np.sqrt(d))/(self.Q**2+self.P**2),
                  ]
 
-        roots = [np.asin(sine) for sine in sines]
+        roots = [np.asin(np.clip(sine,-1.0,1.0)) for sine in sines if -1 <= sine <= 1]
 
-        return roots
+        theta = min(roots, key=lambda x: abs(x-self.theta_1))
+
+        return theta
 
 
 if __name__ == "__main__":
