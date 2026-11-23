@@ -17,7 +17,7 @@ class com():
     def send(self, ang_1: float, ang_3: float):
         """ Sends the info through the serial """
 
-        self.ser.write(f"{ang_1:.6f}, {ang_3:.6f}".encode("ascii"))
+        self.ser.write(f"[{ang_1:.6f},{ang_3:.6f}]".encode("ascii"))
 
     def close(self):
         """ Finishes comunication """
