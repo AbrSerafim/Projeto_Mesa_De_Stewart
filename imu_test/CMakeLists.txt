@@ -33,6 +33,10 @@ project(imu_test C CXX ASM)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
+set(FREERTOS_KERNEL_PATH "${CMAKE_CURRENT_LIST_DIR}/FreeRTOS_Kernel")
+set(FREERTOS_CONFIG_FILE_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
+add_subdirectory(FreeRTOS_Kernel/portable/ThirdParty/GCC/RP2040)
+
 # Add executable. Default name is the project name, version 0.1
 
 add_executable(imu_test imu_test.c )
@@ -46,7 +50,9 @@ pico_enable_stdio_usb(imu_test 1)
 
 # Limit the time spent waiting for USB transmission during sampling.
 target_compile_definitions(imu_test PRIVATE PICO_STDIO_USB_STDOUT_TIMEOUT_US=2000)
-target_link_libraries(imu_test PRIVATE pico_stdlib hardware_i2c m)
+target_link_libraries(imu_test PRIVATE pico_stdlib hardware_i2c hardware_pio FreeRTOS-Kernel-Heap4 m)
+pico_generate_pio_header(imu_test ${CMAKE_CURRENT_LIST_DIR}/quadrature_encoder.pio)
+pico_generate_pio_header(imu_test ${CMAKE_CURRENT_LIST_DIR}/encoder_channel.pio)
 
 pico_add_extra_outputs(imu_test)
 

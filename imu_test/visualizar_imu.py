@@ -1,8 +1,9 @@
-"""Visualiza o CSV da MPU6050 recebido pela porta USB serial do Pico."""
+"""Visualiza a telemetria da IMU, dos encoders e dos fins de curso do Pico."""
 
 from collections import deque
-from math import cos, isfinite, radians, sin
+from math import cos, isfinite, nan, radians, sin
 from time import monotonic
+from typing import NamedTuple
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -15,21 +16,90 @@ from serial.tools import list_ports
 
 
 HISTORY_SECONDS = 10
-SAMPLE_PERIOD = 0.01
-MAX_LINE_BYTES = 128
+LOG_PERIOD = 0.04
+MAX_LINE_BYTES = 512
 COLORS = ("tab:red", "tab:green", "tab:blue")
 BOARD = np.array([[-1, -0.65, 0], [1, -0.65, 0], [1, 0.65, 0], [-1, 0.65, 0]])
+IMU_MESSAGES = (
+    "Inicializando a IMU",
+    "Calibrando a IMU. Mantenha o sensor parado.",
+    "IMU em leitura",
+    "IMU indisponível. Verifique alimentação, SDA e SCL.",
+)
+TRAVEL_MESSAGES = (
+    "Em calibração: acione os dois fins de curso",
+    "Mínimo registrado. Acione o máximo.",
+    "Máximo registrado. Acione o mínimo.",
+    "Curso calibrado",
+)
+
+
+class MotorReading(NamedTuple):
+    count: int
+    pulses_a: int
+    pulses_b: int
+    angle: float
+    rpm: float
+    limits_captured: int | None = None
+    travel_pct: float | None = None
+
+
+class Packet(NamedTuple):
+    imu: tuple[float, ...] | None
+    imu_state: int
+    motors: tuple[MotorReading, MotorReading] | None = None
+    limits: tuple[bool, ...] = ()
+
+
+def parse_motor(fields, travel):
+    count, pulses_a, pulses_b = map(int, fields[:3])
+    angle, rpm = map(float, fields[3:])
+    if min(pulses_a, pulses_b) < 0 or not all(map(isfinite, (angle, rpm))):
+        raise ValueError("Leitura de encoder inválida")
+    if not travel:
+        return MotorReading(count, pulses_a, pulses_b, angle, rpm)
+
+    captured = int(travel[0])
+    if captured not in range(len(TRAVEL_MESSAGES)):
+        raise ValueError("Estado de calibração inválido")
+    percent = None
+    if captured == 3:
+        percent = float(travel[1])
+        if not 0 <= percent <= 100:
+            raise ValueError("Posição relativa fora da escala")
+    elif travel[1]:
+        raise ValueError("Posição relativa sem calibração")
+    return MotorReading(count, pulses_a, pulses_b, angle, rpm, captured, percent)
 
 
 def parse_sample(line):
     fields = line.split(b",")
-    if len(fields) != 9:
-        return None
     try:
-        values = tuple(float(field) for field in fields)
+        if len(fields) == 9:  # Firmware anterior, apenas IMU.
+            imu = tuple(map(float, fields))
+            return Packet(imu, 2) if all(map(isfinite, imu)) else None
+        if len(fields) not in (24, 28):
+            return None
+        state = int(fields[23])
+        if state not in range(len(IMU_MESSAGES)):
+            return None
+        imu = None
+        if state == 2:
+            imu = tuple(map(float, fields[:9]))
+            if not all(map(isfinite, imu)):
+                return None
+        elif any(fields[:9]):
+            return None
+        motors = (
+            parse_motor(fields[9:14], fields[24:26]),
+            parse_motor(fields[14:19], fields[26:28]),
+        )
+        limits = tuple(map(int, fields[19:23]))
+        if any(value not in (0, 1) for value in limits):
+            return None
+        return Packet(imu, state, motors, tuple(map(bool, limits)))
     except ValueError:
         return None
-    return values if all(map(isfinite, values)) else None
 
 
 class SerialLines:
@@ -74,18 +144,127 @@ def add_traces(axis, title, units):
     return traces
 
 
+def batch_times(length, now, period, previous):
+    start = now - (length - 1) * period
+    if previous is not None:
+        start = max(start, previous + (now - previous) / length)
+    return np.linspace(start, now, length) if length > 1 else [now]
+
+
+class MotorPanel:
+    def __init__(self, parent, motor):
+        self.frame = ttk.LabelFrame(parent, text=f"Motor {motor}", padding=8)
+        self.values = []
+        for column, name in enumerate((
+            "Quadratura", "Pulsos A", "Pulsos B", "Ângulo", "Velocidade", "Curso",
+        )):
+            self.frame.columnconfigure(column, weight=1)
+            ttk.Label(self.frame, text=name).grid(row=0, column=column, padx=5)
+            value = ttk.Label(self.frame)
+            value.grid(row=1, column=column, padx=5, pady=(3, 0))
+            self.values.append(value)
+        indicators = ttk.Frame(self.frame)
+        indicators.grid(row=2, columnspan=len(self.values), sticky="ew", pady=(5, 0))
+        self.limit_labels = []
+        for column, name in enumerate(("Mínimo", "Máximo")):
+            indicators.columnconfigure(column, weight=1)
+            ttk.Label(indicators, text=f"Fim de curso {name.lower()}").grid(row=0, column=column, pady=4)
+            label = tk.Label(indicators, padx=10, pady=5)
+            label.grid(row=1, column=column, sticky="ew", padx=3)
+            self.limit_labels.append(label)
+        self.travel_status = ttk.Label(self.frame, anchor="center")
+        self.travel_status.grid(row=3, columnspan=len(self.values), sticky="ew", pady=(6, 0))
+        self.update(None, (None, None))
+
+    def update(self, reading, limits):
+        values = ("—",) * len(self.values)
+        status = "Aguardando dados"
+        if reading is not None:
+            percent = "—" if reading.travel_pct is None else f"{reading.travel_pct:.1f}%"
+            values = (
+                str(reading.count), str(reading.pulses_a), str(reading.pulses_b),
+                f"{reading.angle:.3f}°", f"{reading.rpm:.3f} rpm", percent,
+            )
+            status = ("Firmware sem calibração de curso" if reading.limits_captured is None
+                      else TRAVEL_MESSAGES[reading.limits_captured])
+        self.travel_status.configure(text=status)
+        for label, value in zip(self.values, values):
+            label.configure(text=value)
+        for label, pressed in zip(self.limit_labels, limits):
+            if pressed is None:
+                text, background, foreground = "Sem dados", "#e5e7eb", "#374151"
+            elif pressed:
+                text, background, foreground = "Acionado", "#b91c1c", "#ffffff"
+            else:
+                text, background, foreground = "Livre", "#166534", "#ffffff"
+            label.configure(text=text, background=background, foreground=foreground)
+
+
+class MotorPlots:
+    def __init__(self, parent):
+        figure = Figure(figsize=(11, 4.2), layout="constrained")
+        axes = figure.subplots(2, 2, sharex=True)
+        figure.supxlabel("Tempo relativo ao presente (s)", fontsize=10)
+        self.canvas = FigureCanvasTkAgg(figure, master=parent)
+        self.canvas.get_tk_widget().grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
+        self.traces = []
+        for axis, title, units, field in (
+            (axes[0, 0], "Contagem em quadratura", "contagens", "count"),
+            (axes[0, 1], "Posição entre os fins de curso", "%", "travel_pct"),
+            (axes[1, 0], "Posição angular estimada", "°", "angle"),
+            (axes[1, 1], "Velocidade angular estimada", "RPM", "rpm"),
+        ):
+            axis.set(title=title, ylabel=units, xlim=(-HISTORY_SECONDS, 0))
+            if field == "travel_pct":
+                axis.set(ylim=(0, 100), yticks=(0, 25, 50, 75, 100))
+            axis.grid(alpha=0.3)
+            lines = []
+            for motor, color in ((1, "tab:blue"), (3, "tab:orange")):
+                line, = axis.plot([], [], color=color, label=f"M{motor}", marker=".", markersize=2)
+                lines.append(line)
+            axis.legend(loc="upper left", ncols=len(lines), fontsize=8)
+            self.traces.append((axis, lines, field))
+
+    def update(self, history, now):
+        times = [timestamp - now for timestamp, _ in history]
+        for axis, lines, field in self.traces:
+            for index, line in enumerate(lines):
+                values = [getattr(readings[index], field) for _, readings in history]
+                line.set_data(times, [nan if value is None else value for value in values])
+            if history:
+                axis.relim()
+                axis.autoscale_view(scalex=False)
+        self.canvas.draw_idle()
+
+
 def visualize():
     window = tk.Tk()
-    window.title("MPU6050")
+    window.title("Telemetria do Pico")
     controls = ttk.Frame(window, padding=(8, 6))
     controls.pack(side="top", fill="x")
     port_button = ttk.Button(controls, text="Selecionar porta")
     port_button.pack(side="left")
     port_menu = tk.Menu(port_button, tearoff=False)
+    status = tk.StringVar(value="Selecione a porta serial do Pico")
+    ttk.Label(controls, textvariable=status).pack(side="left", padx=(12, 0))
+
+    tabs = ttk.Notebook(window)
+    tabs.pack(fill="both", expand=True)
+    imu_tab = ttk.Frame(tabs)
+    motors_tab = ttk.Frame(tabs, padding=16)
+    tabs.add(imu_tab, text="IMU")
+    tabs.add(motors_tab, text="Encoders e fins de curso")
+    motor_panels = [MotorPanel(motors_tab, motor) for motor in (1, 3)]
+    for column, panel in enumerate(motor_panels):
+        motors_tab.columnconfigure(column, weight=1, uniform="motors")
+        panel.frame.grid(row=0, column=column, sticky="new", padx=6)
+    motors_tab.rowconfigure(1, weight=1)
+    motor_plots = MotorPlots(motors_tab)
+    motor_history = deque()
 
     figure = Figure(figsize=(12, 6), layout="constrained")
-    canvas = FigureCanvasTkAgg(figure, master=window)
-    toolbar = NavigationToolbar2Tk(canvas, window, pack_toolbar=False)
+    canvas = FigureCanvasTkAgg(figure, master=imu_tab)
+    toolbar = NavigationToolbar2Tk(canvas, imu_tab, pack_toolbar=False)
     toolbar.pack(side="bottom", fill="x")
     canvas.get_tk_widget().pack(fill="both", expand=True)
     grid = figure.add_gridspec(2, 2)
@@ -109,20 +288,27 @@ def visualize():
         for color in COLORS
     ]
 
-    status = figure.suptitle("Selecione a porta serial do Pico")
     history = deque(maxlen=2000)
     port = None
     lines = SerialLines()
     last_sample_at = None
-    message = "Aguardando a MPU6050"
+    last_packet_at = None
+    latest_imu = None
+    message = "Aguardando dados"
     timer = canvas.new_timer(interval=40)
 
     def reset_stream():
-        nonlocal lines, last_sample_at, message
+        nonlocal lines, last_sample_at, last_packet_at, latest_imu, message
         history.clear()
+        motor_history.clear()
+        motor_plots.update(motor_history, monotonic())
         lines = SerialLines()
         last_sample_at = None
-        message = "Aguardando a MPU6050"
+        last_packet_at = None
+        latest_imu = None
+        message = "Aguardando dados"
+        for panel in motor_panels:
+            panel.update(None, (None, None))
         for trace in traces:
             trace.set_data([], [])
         plane.set_visible(False)
@@ -147,7 +333,7 @@ def visualize():
             port.close()
         port = new_port
         reset_stream()
-        status.set_text(f"{port.port} — {message}")
+        status.set(f"{port.port} — {message}")
         canvas.draw_idle()
 
     def show_ports():
@@ -177,41 +363,72 @@ def visualize():
     port_button.configure(command=show_ports)
 
     def refresh():
-        nonlocal port, last_sample_at, message
+        nonlocal port, last_sample_at, last_packet_at, latest_imu, message
         if port is None:
             return
         samples = []
+        motor_samples = []
+        latest = None
         try:
             for line in lines.feed(port.read(min(port.in_waiting, 16384))):
                 if line.startswith(b"#"):
                     history.clear()
                     last_sample_at = None
+                    latest_imu = None
                     message = line[1:].strip().decode("utf-8", errors="replace")
                     samples.clear()
                 else:
-                    sample = parse_sample(line)
-                    if sample is not None:
-                        samples.append(sample)
+                    packet = parse_sample(line)
+                    if packet is None:
+                        continue
+                    latest = packet
+                    if packet.motors is not None:
+                        motor_samples.append(packet.motors)
+                    if packet.imu is None:
+                        history.clear()
+                        last_sample_at = None
+                        latest_imu = None
+                        samples.clear()
+                    else:
+                        samples.append(packet.imu)
         except OSError:
             device = port.port
             port.close()
             port = None
             reset_stream()
-            status.set_text(f"Conexão com {device} interrompida. Selecione uma porta para reconectar.")
+            status.set(f"Conexão com {device} interrompida. Selecione uma porta para reconectar.")
             canvas.draw_idle()
             return
 
         now = monotonic()
+        if motor_samples:
+            previous = motor_history[-1][0] if motor_history else None
+            times = batch_times(len(motor_samples), now, LOG_PERIOD, previous)
+            motor_history.extend(zip(times, motor_samples))
+        while motor_history and motor_history[0][0] < now - HISTORY_SECONDS:
+            motor_history.popleft()
+        if latest is not None:
+            last_packet_at = now
+            message = IMU_MESSAGES[latest.imu_state]
+            if latest.motors is not None:
+                for index, (panel, reading) in enumerate(zip(motor_panels, latest.motors)):
+                    panel.update(reading, latest.limits[2 * index:2 * index + 2])
+            else:
+                for panel in motor_panels:
+                    panel.update(None, (None, None))
+                message += " | Firmware com telemetria somente da IMU"
+        elif last_packet_at is not None and now - last_packet_at > 1:
+            last_packet_at = None
+            message = "Sem dados recentes"
+            for panel in motor_panels:
+                panel.update(None, (None, None))
+
         if samples:
-            start = now - (len(samples) - 1) * SAMPLE_PERIOD
-            if last_sample_at is not None:
-                start = max(start, last_sample_at + (now - last_sample_at) / len(samples))
-            times = np.linspace(start, now, len(samples)) if len(samples) > 1 else [now]
+            period = 0.01 if latest.motors is None else LOG_PERIOD
+            times = batch_times(len(samples), now, period, last_sample_at)
             history.extend((timestamp, *sample) for timestamp, sample in zip(times, samples))
             last_sample_at = now
-            message = "Recebendo dados"
-        elif last_sample_at is not None and now - last_sample_at > 1:
-            message = "Sem dados recentes"
+            latest_imu = samples[-1]
 
         while history and history[0][0] < now - HISTORY_SECONDS:
             history.popleft()
@@ -230,19 +447,29 @@ def visualize():
         plane.set_visible(show_plane)
         for axis in body_axes:
             axis.set_visible(show_plane)
-        if samples:
-            roll, pitch, yaw = samples[-1][6:9]
+        if show_plane and latest_imu is not None:
+            roll, pitch, yaw = latest_imu[6:9]
             rotation = rotation_matrix(roll, pitch, yaw)
             plane.set_verts([BOARD @ rotation.T])
             for axis, (x, y, z) in zip(body_axes, rotation.T):
                 axis.set_data_3d([0, x], [0, y], [0, z])
             orientation.set_title(f"X {roll:.1f}°    Y {pitch:.1f}°    Z relativo {yaw:.1f}°")
-        elif not show_plane:
+        else:
             orientation.set_title("Orientação da IMU")
 
-        status.set_text(f"{port.port} — {message}")
-        canvas.draw_idle()
+        status.set(f"{port.port} — {message}")
+        if tabs.select() == str(imu_tab):
+            canvas.draw_idle()
+        else:
+            motor_plots.update(motor_history, now)
 
+    def redraw_selected_tab(_event):
+        if tabs.select() == str(motors_tab):
+            motor_plots.update(motor_history, monotonic())
+        else:
+            canvas.draw_idle()
+
+    tabs.bind("<<NotebookTabChanged>>", redraw_selected_tab)
     timer.add_callback(refresh)
     timer.start()
     canvas.draw_idle()
