@@ -13,6 +13,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import serial
 from serial.tools import list_ports
+from camera_view import CameraView
 from controle_motores import LOCAL_GRAVITY, PROTOCOL_HELLO, MotorTab, SerialSession
 
 
@@ -255,9 +256,14 @@ def visualize():
     imu_tab = ttk.Frame(tabs)
     motors_tab = ttk.Frame(tabs, padding=16)
     drive_tab = ttk.Frame(tabs, padding=8)
+    camera_tab = ttk.Frame(tabs)
     tabs.add(imu_tab, text="IMU")
     tabs.add(motors_tab, text="Encoders e fins de curso")
     tabs.add(drive_tab, text="Acionamento")
+    tabs.add(camera_tab, text="Câmera")
+    camera_home = ttk.Frame(camera_tab, padding=(8, 6, 8, 0))
+    camera_home.pack(fill="x")
+    camera = CameraView(camera_tab, lambda: tabs.select() == str(camera_tab))
     motor_panels = [MotorPanel(motors_tab, motor) for motor in (1, 3)]
     for column, panel in enumerate(motor_panels):
         motors_tab.columnconfigure(column, weight=1, uniform="motors")
@@ -299,6 +305,8 @@ def visualize():
     session = None
     drive = MotorTab(drive_tab, lambda command: session.send(command) if session else None)
     drive.add_level_controls(imu_actions)
+    camera_home_button = drive.add_home_control(camera_home)
+    camera_home_button.bind("<KeyPress-space>", lambda event: camera.photo_shortcut(event) or "break")
     window.bind("<Escape>", lambda _event: session.send("STOP") if session else None)
     last_sample_at = None
     last_packet_at = None
@@ -464,6 +472,8 @@ def visualize():
     def redraw_selected_tab(_event):
         now = monotonic()
         selected = tabs.select()
+        if selected == str(camera_tab):
+            return
         if selected == str(drive_tab):
             drive.draw()
             return
@@ -505,8 +515,11 @@ def visualize():
         window.mainloop()
     finally:
         timer.stop()
-        if session is not None:
-            session.close()
+        try:
+            if session is not None:
+                session.close()
+        finally:
+            camera.close()
 
 
 if __name__ == "__main__":

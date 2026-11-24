@@ -1,3 +1,7 @@
 matplotlib
 numpy
 pyserial
+opencv-python
+Pillow
+ultralytics>=8.4.0
+pygrabber; sys_platform == "win32"

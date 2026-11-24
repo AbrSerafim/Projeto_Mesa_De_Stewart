@@ -55,7 +55,15 @@ ERRORS = {
     "imu_requer_mesa_parada": "Aguarde pelo menos 2 s com a mesa parada e tente novamente.",
     "referencia_imu_invalida": "Referência inválida. Confira a orientação da IMU.",
     "eixo_z_invertido": "O Z da mesa está medindo para baixo. Confira a montagem da IMU.",
+    "home_requer_curso": "Calibre o curso dos dois motores para usar Home.",
+    "home_requer_encoder": "Aguarde leituras dos dois encoders para usar Home.",
+    "home_em_andamento": "A mesa está indo para Home. Use Parar para interromper.",
 }
+
+HOME_MESSAGES = (
+    "", "Movendo para 40% do curso", "Freio Home ativo", "Movimento para Home interrompido",
+    "Tempo excedido ao buscar Home", "Home interrompido por falha no motor",
+)
 
 LEVEL_MESSAGES = (
     "Pronta para nivelar", "Medindo a inclinação inicial", "Medindo o efeito do M1",
@@ -488,6 +496,8 @@ class MotorTab:
         self.imu_reference, self.imu_file_warning = load_imu_reference()
         self.imu_message = StringVar()
         self.imu_buttons = []
+        self.home_buttons = []
+        self.home_message = StringVar()
         self.message = StringVar(value=warning or "Aguardando sessão de acionamento")
         self.warning = warning
         self.toolbar = ttk.Frame(parent)
@@ -513,6 +523,9 @@ class MotorTab:
                             command=lambda: self.action(self.run_circle))
         button.pack(side="left", padx=4)
         self.buttons.append(button)
+        home_controls = ttk.Frame(parent)
+        home_controls.pack(fill="x", pady=(4, 0))
+        self.add_home_control(home_controls)
         ttk.Label(parent, textvariable=self.message).pack(anchor="w", pady=4)
         layout = ttk.Frame(parent)
         layout.pack(fill="x")
@@ -568,6 +581,9 @@ class MotorTab:
         for button in self.imu_buttons:
             available = self.ready and self.imu_ready and not self.level_running and self.imu_pending is None
             button.configure(state="normal" if available else "disabled")
+        for button in self.home_buttons:
+            available = self.ready and self.home_state is not None and self.home_state != 1 and not self.level_running
+            button.configure(state="normal" if available else "disabled")
         for panel in self.panels.values():
             for button in panel.buttons:
                 button.configure(state="normal" if self.ready else "disabled")
@@ -587,6 +603,8 @@ class MotorTab:
         self.imu_pending = None
         self.imu_retry_at = 0
         self.imu_message.set(self.imu_file_warning)
+        self.home_state = None
+        self.home_message.set("")
         self.set_motion_limits(None)
         self.samples = {motor: deque(maxlen=2000) for motor in MOTORS}
         self.steps = {motor: [] for motor in MOTORS}
@@ -623,6 +641,14 @@ class MotorTab:
             self.imu_buttons.append(button)
         ttk.Label(imu_row, textvariable=self.imu_message).pack(side="left")
         self.set_buttons()
+
+    def add_home_control(self, parent):
+        button = ttk.Button(parent, text="Travar em Home (40%)", command=lambda: self.action(lambda: "HOME"),
+                            state="disabled")
+        button.pack(side="left", padx=(0, 6))
+        ttk.Label(parent, textvariable=self.home_message).pack(side="left")
+        self.home_buttons.append(button)
+        return button
 
     def imu_action(self, command):
         if not (self.ready and self.imu_ready and self.imu_pending is None and not self.level_running):
@@ -677,14 +703,18 @@ class MotorTab:
                 self.message.set(f"Motor {motor} · Aguarde a confirmação do Pico.")
                 return
             self.pending[motor] = tuple(map(float, command.split()[2:]))
-        elif command in ("CAL", "CIRCLE", "LEVEL") or command.startswith(("GO ", "STEP ", "WAVE ")):
-            motors = MOTORS if command in ("CAL", "CIRCLE", "LEVEL") else (int(command.split()[1]),)
+        elif command in ("CAL", "CIRCLE", "LEVEL", "HOME") or command.startswith(("GO ", "STEP ", "WAVE ")):
+            motors = MOTORS if command in ("CAL", "CIRCLE", "LEVEL", "HOME") else (int(command.split()[1]),)
             if not self.check_applied(motors, calibration=command == "CAL"):
                 if command == "LEVEL":
                     self.level_message.set(self.message.get())
+                if command == "HOME":
+                    self.home_message.set(self.message.get())
                 return
             if command == "LEVEL":
                 self.level_message.set("Aguardando confirmação do Pico")
+            if command == "HOME":
+                self.home_message.set("Solicitando Home")
         if command.startswith("STEP "):
             self.plot_mode.set("Degrau +1°")
         elif command.startswith(("GO ", "WAVE ", "CIRCLE ")):
@@ -733,6 +763,8 @@ class MotorTab:
             self.configured.clear()
             self.pending.clear()
             self.applied.clear()
+            self.home_state = None
+            self.home_message.set("")
             self.imu_ready = False
             self.imu_pending = None
             self.imu_retry_at = monotonic() + 2
@@ -751,6 +783,15 @@ class MotorTab:
             self.set_buttons()
         elif fields[0] == "!LEVEL" and len(fields) == 5 and self.compatible:
             self.receive_level(fields[1:])
+        elif fields[0] == "!HOME" and len(fields) == 2 and self.compatible:
+            try:
+                state = int(fields[1])
+            except ValueError:
+                return
+            if state in range(len(HOME_MESSAGES)) and state != self.home_state:
+                self.home_state = state
+                self.home_message.set(HOME_MESSAGES[state])
+                self.set_buttons()
         elif fields[0] == "!IMUCFG" and len(fields) == 4 and self.compatible:
             self.receive_imu_reference(fields[1:])
         elif fields[0] == "!CFG" and len(fields) == 13 and self.compatible:
@@ -774,6 +815,8 @@ class MotorTab:
             self.message.set(f"{command} · {ERRORS.get(reason, reason.replace('_', ' '))}")
             if command == "LEVEL":
                 self.level_message.set(ERRORS.get(reason, reason.replace("_", " ")))
+            if command == "HOME":
+                self.home_message.set(ERRORS.get(reason, reason.replace("_", " ")))
             if command in ("IMUZERO", "IMUYAW", "IMUCFG"):
                 self.imu_pending = None
                 self.imu_message.set(ERRORS.get(reason, reason.replace("_", " ")))

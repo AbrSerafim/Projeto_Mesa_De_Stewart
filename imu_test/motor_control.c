@@ -46,6 +46,9 @@
 #define LEVEL_SAMPLES 16u
 #define LEVEL_SETTLE_US 300000u
 #define RAD_TO_DEG 57.29577951f
+#define HOME_TRAVEL_FRACTION .40f
+#define HOME_SETTLE_US 200000u
+#define HOME_TIMEOUT_US 45000000u
 
 typedef struct {
     uint in_positive, in_negative, enable, min_switch, max_switch;
@@ -77,6 +80,8 @@ typedef enum {
     LEVEL_DONE, LEVEL_INTERRUPTED, LEVEL_IMU, LEVEL_TIMEOUT, LEVEL_GEOMETRY,
     LEVEL_TRAVEL, LEVEL_DIVERGED, LEVEL_MOTOR,
 } LevelState;
+
+typedef enum { HOME_IDLE, HOME_MOVING, HOME_BRAKED, HOME_INTERRUPTED, HOME_TIMEOUT, HOME_MOTOR } HomeState;
 
 typedef struct {
     float x, y;
@@ -131,6 +136,8 @@ static bool linked;
 static bool motion_limits_enabled = true;
 static uint32_t next_step_id;
 static Leveling leveling;
+static HomeState home_state;
+static uint64_t home_started_at, home_quiet_at;
 static struct {
     float x, y, z, gyro;
     uint64_t at;
@@ -139,6 +146,11 @@ static struct {
 static bool level_active(void)
 {
     return leveling.state >= LEVEL_BASELINE && leveling.state <= LEVEL_CORRECT;
+}
+
+static bool limits_for_motion(void)
+{
+    return motion_limits_enabled || home_state == HOME_MOVING;
 }
 
 static float speed_limit(const Motor *m)
@@ -187,7 +199,8 @@ static void neutral_output(unsigned i, bool brake)
     if (!brake) {
         gpio_put(p->enable, 0);
     }
-    set_input_pwm(p, 0, 0);
+    const uint16_t level = brake && home_state == HOME_BRAKED ? PWM_TOP + 1u : 0;
+    pwm_set_both_levels(pwm_gpio_to_slice_num(p->in_positive), level, level);
     if (brake) {
         gpio_put(p->enable, 1);
     }
@@ -251,7 +264,7 @@ static void update_coefficients(Motor *m)
 
 static float position_integral_limit(const Motor *m)
 {
-    return .25f * (motion_limits_enabled ? speed_limit(m) : 360.0f);
+    return .25f * (limits_for_motion() ? speed_limit(m) : 360.0f);
 }
 
 static void reset_speed_pi(Motor *m)
@@ -285,6 +298,11 @@ static void invalidate_travel(Motor *m)
 
 static void stop_all(Mode mode, Fault fault)
 {
+    if (home_state == HOME_MOVING) {
+        home_state = HOME_INTERRUPTED;
+    } else if (home_state == HOME_BRAKED) {
+        home_state = HOME_IDLE;
+    }
     if (level_active()) {
         leveling.state = LEVEL_INTERRUPTED;
     }
@@ -304,11 +322,15 @@ static void stop_all(Mode mode, Fault fault)
 
 static void trip_motor(unsigned i, Fault fault)
 {
+    const bool homing = home_state == HOME_MOVING;
     if (level_active()) {
         leveling.state = LEVEL_MOTOR;
     }
     motors[i].fault = fault;
     stop_all(BRAKE, NO_FAULT);
+    if (homing) {
+        home_state = HOME_MOTOR;
+    }
 }
 
 void motor_imu_sample(float ax, float ay, float az, float gyro_norm, uint64_t sampled_at)
@@ -394,7 +416,7 @@ static int encoder_direction(const Motor *m)
 
 static bool overspeed(Motor *m, float max_speed)
 {
-    if (!motion_limits_enabled) {
+    if (!limits_for_motion()) {
         return false;
     }
     // Independent windows prevent one encoder burst from counting twice.
@@ -582,7 +604,7 @@ static void position_update(Motor *m, uint64_t now, float low, float high)
         m->goal = m->baseline + m->amplitude * clamp(elapsed / m->period, 0, 1);
     }
     const float accel = acceleration_limit(m);
-    if (motion_limits_enabled) {
+    if (limits_for_motion()) {
         const float distance = m->goal - m->reference;
         const float half_step = 0.5f * accel * CONTROL_DT;
         const float desired_speed = copysignf(fminf(speed_limit(m),
@@ -604,12 +626,13 @@ static void position_update(Motor *m, uint64_t now, float low, float high)
     }
     m->previous_angle = m->position;
     const float target = clamp(base + m->integral, low, high);
-    m->velocity_target = motion_limits_enabled
+    m->velocity_target = limits_for_motion()
         ? approach(m->velocity_target, target, accel * CONTROL_DT) : target;
 }
 
 static void finish_level(LevelState state);
 static void level_update(uint64_t now);
+static void home_update(uint64_t now);
 
 static void update_motor(unsigned i, uint64_t now, bool control_sample)
 {
@@ -646,8 +669,8 @@ static void update_motor(unsigned i, uint64_t now, bool control_sample)
         const bool fixed_goal = m->mode == POSITION || m->mode == STEP;
         const float lower = fixed_goal ? m->goal : 0;
         const float upper = fixed_goal ? m->goal : m->span;
-        const float min_speed = motion_limits_enabled ? speed_bound(m->position - lower, m) : INFINITY;
-        const float max_speed = motion_limits_enabled ? speed_bound(upper - m->position, m) : INFINITY;
+        const float min_speed = limits_for_motion() ? speed_bound(m->position - lower, m) : INFINITY;
+        const float max_speed = limits_for_motion() ? speed_bound(upper - m->position, m) : INFINITY;
         const float low = (m->raw & LIMIT_MIN) ? 0 : -min_speed;
         const float high = (m->raw & LIMIT_MAX) ? 0 : max_speed;
         if (m->mode == STEP) {
@@ -682,8 +705,12 @@ static void update_motor(unsigned i, uint64_t now, bool control_sample)
         }
     }
     bridge_output(i, duty, now);
-    if (i == MOTOR_1 && control_sample && level_active()) {
-        level_update(now);
+    if (i == MOTOR_1 && control_sample) {
+        if (level_active()) {
+            level_update(now);
+        } else if (home_state == HOME_MOVING) {
+            home_update(now);
+        }
     }
     m->report_at = now;
     if (control_sample) {
@@ -783,6 +810,9 @@ static bool position_available(unsigned i)
 
 static void start_motion(Motor *m, Mode mode, float goal, float amplitude, float period, uint64_t now)
 {
+    if (home_state == HOME_BRAKED) {
+        home_state = HOME_IDLE;
+    }
     if (leveling.state == LEVEL_DONE) {
         leveling.state = LEVEL_IDLE;
     }
@@ -798,6 +828,70 @@ static void start_motion(Motor *m, Mode mode, float goal, float amplitude, float
     m->period = period;
     m->step_elapsed = 0;
     m->step_id = mode == STEP ? ++next_step_id : 0;
+}
+
+static float home_goal(const Motor *m)
+{
+    return HOME_TRAVEL_FRACTION * m->span;
+}
+
+static void home_update(uint64_t now)
+{
+    if (now - home_started_at > HOME_TIMEOUT_US) {
+        stop_all(BRAKE, NO_FAULT);
+        home_state = HOME_TIMEOUT;
+        return;
+    }
+    for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
+        const Motor *m = &motors[i];
+        if (m->sampled_at == 0 || now - m->sampled_at > 3u * SAMPLE_US) {
+            trip_motor(i, ENCODER_STALE);
+            return;
+        }
+        if (fabsf(home_goal(m) - m->position) > POSITION_RELEASE_DEG || m->output != 0
+            || fabsf(m->velocity) >= ENCODER_DEGREES_PER_COUNT / .15f) {
+            home_quiet_at = 0;
+            return;
+        }
+    }
+    if (home_quiet_at == 0) {
+        home_quiet_at = now;
+    } else if (now - home_quiet_at >= HOME_SETTLE_US) {
+        stop_all(BRAKE, NO_FAULT);
+        home_state = HOME_BRAKED;
+        for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
+            neutral_output(i, true);
+        }
+    }
+}
+
+static const char *begin_home(uint64_t now)
+{
+    for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
+        const Motor *m = &motors[i];
+        if (m->travel.captured != LIMIT_BOTH || m->span <= 0) {
+            return "home_requer_curso";
+        }
+        if (read_switches(&pins[i]) == LIMIT_BOTH) {
+            return "fins_simultaneos";
+        }
+        if (m->sampled_at == 0 || now - m->sampled_at > 3u * SAMPLE_US) {
+            return "home_requer_encoder";
+        }
+        const char *error = position_config_error(m);
+        if (error && fabsf(home_goal(m) - m->position) > POSITION_CAPTURE_DEG) {
+            return error;
+        }
+    }
+    stop_all(BRAKE, NO_FAULT);
+    home_state = HOME_MOVING;
+    home_started_at = now;
+    home_quiet_at = 0;
+    for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
+        Motor *m = &motors[i];
+        start_motion(m, POSITION, home_goal(m), 0, 0, now);
+    }
+    return NULL;
 }
 
 static void finish_level(LevelState state)
@@ -1014,6 +1108,9 @@ static const char *begin_level(uint64_t now)
         }
         targets[i] = m->position;
     }
+    if (home_state == HOME_BRAKED) {
+        home_state = HOME_IDLE;
+    }
     leveling = (Leveling){.started_at = now, .tilt = -1};
     level_move(LEVEL_BASELINE, targets, now);
     return NULL;
@@ -1046,6 +1143,9 @@ static const char *dispatch(const char *cmd, const float *v, size_t n, uint64_t 
     }
     if (strcmp(cmd, "IMUGET") == 0 && n == 0) {
         return NULL;
+    }
+    if (home_state == HOME_MOVING && strcmp(cmd, "COAST") != 0) {
+        return "home_em_andamento";
     }
     if (level_active()) {
         return "nivelamento_em_andamento";
@@ -1100,6 +1200,9 @@ static const char *dispatch(const char *cmd, const float *v, size_t n, uint64_t 
     if (motors[MOTOR_1].mode == CALIBRATE || motors[MOTOR_3].mode == CALIBRATE) {
         return "calibracao_em_andamento";
     }
+    if (strcmp(cmd, "HOME") == 0 && n == 0) {
+        return begin_home(now);
+    }
     if (strcmp(cmd, "CAL") == 0 && n == 0) {
         if (read_switches(&pins[MOTOR_1]) != 0 || read_switches(&pins[MOTOR_3]) != 0) {
             return "libere_os_fins_de_curso";
@@ -1112,6 +1215,7 @@ static const char *dispatch(const char *cmd, const float *v, size_t n, uint64_t 
         }
         invalidate_travel(&motors[MOTOR_3]);
         leveling.state = LEVEL_IDLE;
+        home_state = HOME_IDLE;
         motors[MOTOR_3].fault = NO_FAULT;
         begin_calibration(&motors[MOTOR_1], now);
         return NULL;
@@ -1150,6 +1254,9 @@ static const char *dispatch(const char *cmd, const float *v, size_t n, uint64_t 
             }
             invalidate_travel(m);
             leveling.state = LEVEL_IDLE;
+            if (home_state == HOME_BRAKED) {
+                home_state = HOME_IDLE;
+            }
         }
         const ControlLaw law = (ControlLaw)v[11];
         const bool gains_changed = m->cfg.kp != v[1] || m->cfg.ki != v[2]
@@ -1242,10 +1349,12 @@ void motor_command(char *line)
         last_heartbeat = now;
         const Settings m1 = motors[MOTOR_1].cfg;
         const Settings m3 = motors[MOTOR_3].cfg;
+        const HomeState home = home_state;
         xSemaphoreGive(lock);
         puts("!HELLO,8");
         printf("!SCALE,%.7g\n", ENCODER_DEGREES_PER_COUNT);
         puts("!LIMITS,1");
+        printf("!HOME,%u\n", (unsigned)home);
         imu_send_reference();
         print_settings(MOTOR_1, m1);
         print_settings(MOTOR_3, m3);
@@ -1307,16 +1416,20 @@ void motor_send_updates(void)
     }
     static uint64_t last_level_report;
     static LevelState last_level_state;
+    static HomeState last_home_state;
     xSemaphoreTake(lock, portMAX_DELAY);
     const LevelState state = leveling.state;
+    const HomeState home = home_state;
     const float tilt = state == LEVEL_IDLE ? -1 : leveling.tilt;
     const float m1 = leveling.result[MOTOR_1];
     const float m3 = leveling.result[MOTOR_3];
     const uint64_t now = time_us_64();
     xSemaphoreGive(lock);
-    if (state != last_level_state || now - last_level_report >= 250000u) {
+    if (state != last_level_state || home != last_home_state || now - last_level_report >= 250000u) {
         last_level_report = now;
         last_level_state = state;
+        last_home_state = home;
         printf("!LEVEL,%u,%.2f,%.2f,%.2f\n", (unsigned)state, tilt, m1, m3);
+        printf("!HOME,%u\n", (unsigned)home);
     }
 }
