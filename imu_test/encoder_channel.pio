@@ -1,0 +1,17 @@
+.program encoder_channel
+
+; Count low-to-high transitions using a wrapping, decrementing X register.
+; Keep publishing X so the CPU can sample whether the input moves or not.
+.wrap_target
+low:
+    mov isr, x
+    push noblock
+    jmp pin rising
+    jmp low
+rising:
+    jmp x-- high
+high:
+    mov isr, x
+    push noblock
+    jmp pin high
+.wrap
