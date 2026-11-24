@@ -9,6 +9,7 @@
 #include "FreeRTOS.h"
 #include "semphr.h"
 #include "task.h"
+#include "hardware/clocks.h"
 #include "hardware/pwm.h"
 #include "hardware/watchdog.h"
 #include "pico/stdlib.h"
@@ -19,18 +20,22 @@
 #define HISTORY_SAMPLES 30u
 #define LINK_TIMEOUT_US 1000000u
 #define PHASE_TIMEOUT_US 45000000u
-#define STALL_TIMEOUT_US 4000000u
+#define START_ASSIST_DELAY_US 150000u
+#define START_ASSIST_RATE 55.0f
+#define MEASURED_START_ASSIST_RATE 85.0f
+#define STALL_AT_LIMIT_US 750000u
 #define STEP_DURATION_US 6000000u
 #define PWM_TOP 6249u
+#define ENABLE_PWM_HZ 2000u
 #define PWM_RISE_PER_TICK (25.0f * ENCODER_PERIOD_MS / 1000.0f)
 #define REVERSAL_US 30000u
 #define CAL_PAUSE_US 80000u
 #define SPEED_GUARD_WINDOW_US 150000u
-#define SPEED_PI_PERIOD_US 50000u
-// Reference PI of 1.20 and 0.90 per rpm, converted to degrees/second.
+#define SPEED_PI_HOLD_US 100000u
+#define SPEED_CONTROL_SAMPLES (50u / ENCODER_PERIOD_MS)
+// Bench PI gains converted from rpm to degrees per second.
 #define SPEED_PI_KP 0.20f
 #define SPEED_PI_KI 0.15f
-// Duty that overcame static friction in the earlier position bench test.
 #define FRICTION_DUTY_PERCENT 13.0f
 #define FRICTION_BLEND_SPEED 1.0f
 #define POSITION_CAPTURE_DEG ENCODER_DEGREES_PER_COUNT
@@ -49,14 +54,22 @@
 #define HOME_TRAVEL_FRACTION .40f
 #define HOME_SETTLE_US 200000u
 #define HOME_TIMEOUT_US 45000000u
+#define HOME_PERCENT (100.0f * HOME_TRAVEL_FRACTION)
+#define BALL_TRAVEL_MIN 1.0f
+#define BALL_TRAVEL_MAX 99.0f
+#define BALL_TIMEOUT_US 450000u
+#define BALL_SWITCH_CONFIRM_US 25000u
+#define PWM_TEST_TIMEOUT_US 350000u
+#define PWM_TEST_MARGIN_DEG 2.0f
+#define PWM_TEST_RISE_PER_TICK (5.0f * ENCODER_PERIOD_MS / 1000.0f)
 
 typedef struct {
     uint in_positive, in_negative, enable, min_switch, max_switch;
 } Pins;
 
 static const Pins pins[MOTOR_COUNT] = {
-    {2, 3, 16, 10, 11},
-    {15, 14, 17, 12, 13},
+    {2, 3, 0, 10, 11},   // M1: IN1/IN2, ENA
+    {15, 14, 1, 12, 13}, // M3: IN4/IN3, ENB
 };
 
 typedef enum { CONTROL_P, CONTROL_PI, CONTROL_PID, CONTROL_PIDF } ControlLaw;
@@ -68,11 +81,12 @@ typedef struct {
     ControlLaw law;
 } Settings;
 
-typedef enum { BRAKE, COAST, CALIBRATE, POSITION, STEP, SINE, COSINE, RAMP } Mode;
+typedef enum { BRAKE, COAST, CALIBRATE, POSITION, STEP, SINE, COSINE, RAMP, PWM_TEST } Mode;
 typedef enum { SEEK_FAST, BACK_OFF, SEEK_SLOW, CLEAR_SWITCH } Phase;
 typedef enum {
     NO_FAULT, LINK_LOST, SWITCH_CONFLICT, WRONG_SWITCH, CAL_TIMEOUT,
     ENCODER_STALE, STALLED, INVALID_SPAN, UNEXPECTED_SWITCH, OVERSPEED, OUT_OF_TRAVEL,
+    BALL_ENDSTOP, BALL_OUTSIDE_WINDOW, BALL_CENTER_TIMEOUT, BALL_INVALID_TARGET,
 } Fault;
 
 typedef enum {
@@ -82,6 +96,7 @@ typedef enum {
 } LevelState;
 
 typedef enum { HOME_IDLE, HOME_MOVING, HOME_BRAKED, HOME_INTERRUPTED, HOME_TIMEOUT, HOME_MOTOR } HomeState;
+typedef enum { BALL_IDLE, BALL_ACTIVE, BALL_TIMEOUT, BALL_MOTOR, BALL_CENTERING } BallState;
 
 typedef struct {
     float x, y;
@@ -108,21 +123,23 @@ typedef struct {
     int64_t counts[HISTORY_SAMPLES];
     uint64_t times[HISTORY_SAMPLES];
     unsigned speed_slot;
-    uint64_t sampled_at, phase_at, moved_at, started_at, report_at, drive_at;
+    uint64_t sampled_at, phase_at, stalled_at, started_at, report_at, drive_at;
     uint64_t guard_at, speed_pi_at;
     uint64_t capture_at;
+    uint64_t ball_switch_at, encoder_motion_at;
     int64_t guard_count;
     bool guard_excess;
     uint32_t step_id;
     float step_elapsed;
     float velocity, position, goal, reference, ref_velocity, output, requested;
     float fault_speed, fault_threshold;
-    float previous_goal_error;
+    float previous_goal_error, control_velocity;
+    float breakaway_forward, breakaway_reverse;
     float velocity_target, speed_setpoint, speed_integral;
     int speed_direction;
     float integral, derivative, previous_angle, ki_ts, alpha, beta;
     float baseline, amplitude, period;
-    float span;
+    float span, ball_min, ball_max, ball_duty;
 } Motor;
 
 static Motor motors[MOTOR_COUNT] = {
@@ -138,6 +155,23 @@ static uint32_t next_step_id;
 static Leveling leveling;
 static HomeState home_state;
 static uint64_t home_started_at, home_quiet_at;
+static BallState ball_state;
+static uint64_t ball_command_at, ball_center_started_at, ball_center_quiet_at;
+typedef struct {
+    unsigned motor;
+    Fault fault;
+    float position, target, duty, speed, threshold;
+} BallFault;
+static BallFault ball_fault;
+typedef enum { PWM_IDLE, PWM_RUNNING, PWM_FOUND, PWM_INTERRUPTED } PwmTestState;
+static struct {
+    PwmTestState state;
+    unsigned motor;
+    int direction;
+    int64_t start_count;
+    uint64_t received_at;
+    float target, first_duty;
+} pwm_test;
 static struct {
     float x, y, z, gyro;
     uint64_t at;
@@ -148,24 +182,30 @@ static bool level_active(void)
     return leveling.state >= LEVEL_BASELINE && leveling.state <= LEVEL_CORRECT;
 }
 
+static bool ball_running(void)
+{
+    return ball_state == BALL_ACTIVE || ball_state == BALL_CENTERING;
+}
+
 static bool limits_for_motion(void)
 {
-    return motion_limits_enabled || home_state == HOME_MOVING;
+    return motion_limits_enabled || home_state == HOME_MOVING || ball_running();
 }
 
 static float speed_limit(const Motor *m)
 {
-    return level_active() ? fminf(m->cfg.speed, 20) : m->cfg.speed;
+    return level_active() || ball_running() ? fminf(m->cfg.speed, 20) : m->cfg.speed;
 }
 
 static float acceleration_limit(const Motor *m)
 {
-    return level_active() ? fminf(m->cfg.acceleration, 60) : m->cfg.acceleration;
+    return level_active() || ball_running() ? fminf(m->cfg.acceleration, 60) : m->cfg.acceleration;
 }
 
 static float duty_limit(const Motor *m)
 {
-    return level_active() ? fminf(m->cfg.duty, 30) : m->cfg.duty;
+    const float limit = ball_running() ? m->ball_duty : level_active() ? 30 : 100;
+    return fminf(m->cfg.duty, limit);
 }
 
 static float clamp(float value, float low, float high)
@@ -185,30 +225,32 @@ static unsigned read_switches(const Pins *p)
          | ((levels & (1u << p->max_switch)) == 0 ? LIMIT_MAX : 0);
 }
 
-static void set_input_pwm(const Pins *p, int direction, uint16_t level)
+static void set_direction(const Pins *p, int direction)
 {
-    const uint pin = direction > 0 ? p->in_positive : p->in_negative;
-    const bool channel_a = pwm_gpio_to_channel(pin) == PWM_CHAN_A;
-    pwm_set_both_levels(pwm_gpio_to_slice_num(pin), channel_a ? level : 0, channel_a ? 0 : level);
+    gpio_put_masked((1u << p->in_positive) | (1u << p->in_negative),
+                    direction > 0 ? 1u << p->in_positive : direction < 0 ? 1u << p->in_negative : 0);
+}
+
+static void idle_bridge(const Pins *p, bool brake)
+{
+    gpio_set_outover(p->enable, GPIO_OVERRIDE_LOW);
+    pwm_set_gpio_level(p->enable, 0);
+    const uint32_t inputs = (1u << p->in_positive) | (1u << p->in_negative);
+    gpio_put_masked(inputs, brake && home_state == HOME_BRAKED ? inputs : 0);
+    if (brake) {
+        gpio_set_outover(p->enable, GPIO_OVERRIDE_HIGH);
+    }
 }
 
 static void neutral_output(unsigned i, bool brake)
 {
     Motor *m = &motors[i];
-    const Pins *p = &pins[i];
-    if (!brake) {
-        gpio_put(p->enable, 0);
-    }
-    const uint16_t level = brake && home_state == HOME_BRAKED ? PWM_TOP + 1u : 0;
-    pwm_set_both_levels(pwm_gpio_to_slice_num(p->in_positive), level, level);
-    if (brake) {
-        gpio_put(p->enable, 1);
-    }
+    idle_bridge(&pins[i], brake);
     m->output = 0;
     m->last_direction = 0;
 }
 
-static void bridge_output(unsigned i, float duty, uint64_t now)
+static void bridge_output(unsigned i, float duty, bool brake_at_zero, uint64_t now)
 {
     Motor *m = &motors[i];
     const Pins *p = &pins[i];
@@ -228,30 +270,36 @@ static void bridge_output(unsigned i, float duty, uint64_t now)
         return;
     }
     const int direction = duty == 0 ? 0 : (duty > 0 ? 1 : -1) * m->cfg.polarity;
-    float target = duty;
-    if (m->output * duty < 0) {
-        target = 0;
-    }
     if (m->output == 0 && direction != 0 && direction != m->last_direction) {
-        set_input_pwm(p, 0, 0);
-        gpio_put(p->enable, 1);
+        idle_bridge(p, true);
         m->drive_at = now + (m->last_direction == 0 ? SAMPLE_US : REVERSAL_US);
         m->last_direction = direction;
         return;
     }
-    if (m->output == 0 && (direction == 0 || now < m->drive_at)) {
-        set_input_pwm(p, 0, 0);
-        gpio_put(p->enable, 1);
+    if (m->output * duty < 0 || (m->output == 0 && now < m->drive_at)) {
+        idle_bridge(p, true);
+        m->output = 0;
         return;
     }
-    const float limited = m->mode == CALIBRATE && fabsf(target) > fabsf(m->output)
-        ? approach(m->output, target, PWM_RISE_PER_TICK) : target;
     const float max_duty = duty_limit(m);
-    const float next = clamp(limited, -max_duty, max_duty);
+    const float target = clamp(duty, -max_duty, max_duty);
+    const float rise = m->mode == PWM_TEST ? PWM_TEST_RISE_PER_TICK
+        : m->mode == CALIBRATE ? PWM_RISE_PER_TICK : INFINITY;
+    const float next = fabsf(target) > fabsf(m->output) ? approach(m->output, target, rise) : target;
     const uint16_t level = (uint16_t)roundf(fabsf(next) * (PWM_TOP + 1) / 100.0f);
-    set_input_pwm(p, m->last_direction, level);
-    gpio_put(p->enable, 1);
-    m->output = level == 0 ? 0 : next;
+    if (level == 0) {
+        // A zero effort during speed regulation disables EN. Explicit stops and limits brake.
+        idle_bridge(p, brake_at_zero || raw != 0);
+        m->output = 0;
+        return;
+    }
+    if (m->output == 0) {
+        gpio_set_outover(p->enable, GPIO_OVERRIDE_LOW);
+        set_direction(p, m->last_direction);
+    }
+    pwm_set_gpio_level(p->enable, level);
+    gpio_set_outover(p->enable, GPIO_OVERRIDE_NORMAL);
+    m->output = next;
 }
 
 static void update_coefficients(Motor *m)
@@ -286,8 +334,10 @@ static void reset_control(Motor *m)
     m->velocity_target = 0;
     reset_speed_pi(m);
     m->guard_at = 0;
+    m->stalled_at = 0;
     m->guard_excess = false;
     m->capture_at = 0;
+    m->ball_switch_at = 0;
 }
 
 static void invalidate_travel(Motor *m)
@@ -298,6 +348,12 @@ static void invalidate_travel(Motor *m)
 
 static void stop_all(Mode mode, Fault fault)
 {
+    if (pwm_test.state == PWM_RUNNING) {
+        pwm_test.state = PWM_INTERRUPTED;
+    }
+    if (ball_running()) {
+        ball_state = BALL_IDLE;
+    }
     if (home_state == HOME_MOVING) {
         home_state = HOME_INTERRUPTED;
     } else if (home_state == HOME_BRAKED) {
@@ -323,6 +379,17 @@ static void stop_all(Mode mode, Fault fault)
 static void trip_motor(unsigned i, Fault fault)
 {
     const bool homing = home_state == HOME_MOVING;
+    const bool balancing = ball_running();
+    if (balancing) {
+        const Motor *m = &motors[i];
+        ball_fault.motor = i == MOTOR_1 ? 1 : 3;
+        ball_fault.fault = fault;
+        ball_fault.position = m->span > 0 ? 100 * m->position / m->span : 0;
+        ball_fault.target = m->span > 0 ? 100 * m->goal / m->span : 0;
+        ball_fault.duty = m->output;
+        ball_fault.speed = fault == OVERSPEED ? m->fault_speed : fabsf(m->velocity);
+        ball_fault.threshold = fault == OVERSPEED ? m->fault_threshold : 0;
+    }
     if (level_active()) {
         leveling.state = LEVEL_MOTOR;
     }
@@ -330,6 +397,9 @@ static void trip_motor(unsigned i, Fault fault)
     stop_all(BRAKE, NO_FAULT);
     if (homing) {
         home_state = HOME_MOTOR;
+    }
+    if (balancing) {
+        ball_state = BALL_MOTOR;
     }
 }
 
@@ -363,16 +433,16 @@ void motors_init(void)
             gpio_init(switches[n]);
             gpio_pull_up(switches[n]);
         }
-        const uint slice = pwm_gpio_to_slice_num(p->in_positive);
-        pwm_config config = pwm_get_default_config();
-        pwm_config_set_wrap(&config, PWM_TOP);
-        pwm_init(slice, &config, false);
-        set_input_pwm(p, 0, 0);
-        gpio_set_function(p->in_positive, GPIO_FUNC_PWM);
-        gpio_set_function(p->in_negative, GPIO_FUNC_PWM);
-        pwm_set_enabled(slice, true);
+        gpio_set_function(p->enable, GPIO_FUNC_PWM);
+        gpio_set_outover(p->enable, GPIO_OVERRIDE_LOW);
         update_coefficients(&motors[i]);
     }
+    // GPIO0 and GPIO1 share one PWM slice, with independent channel compare values.
+    const uint slice = pwm_gpio_to_slice_num(pins[MOTOR_1].enable);
+    pwm_config config = pwm_get_default_config();
+    pwm_config_set_wrap(&config, PWM_TOP);
+    pwm_config_set_clkdiv(&config, (float)clock_get_hz(clk_sys) / ((PWM_TOP + 1u) * ENABLE_PWM_HZ));
+    pwm_init(slice, &config, true);
 }
 
 void motor_encoder_sample(unsigned i, int64_t count, uint64_t sampled_at)
@@ -383,6 +453,11 @@ void motor_encoder_sample(unsigned i, int64_t count, uint64_t sampled_at)
     if (m->times[oldest] != 0 && sampled_at > m->times[oldest]) {
         const float dt = (sampled_at - m->times[oldest]) * 1e-6f;
         m->velocity = (float)(count - m->counts[oldest]) * ENCODER_DEGREES_PER_COUNT / dt;
+    }
+    const unsigned recent = (oldest + HISTORY_SAMPLES - SPEED_CONTROL_SAMPLES) % HISTORY_SAMPLES;
+    if (m->times[recent] != 0 && sampled_at > m->times[recent]) {
+        const float dt = (sampled_at - m->times[recent]) * 1e-6f;
+        m->control_velocity = (float)(count - m->counts[recent]) * ENCODER_DEGREES_PER_COUNT / dt;
     }
     m->counts[oldest] = count;
     m->times[oldest] = sampled_at;
@@ -396,7 +471,7 @@ static void enter_phase(Motor *m, Phase phase, uint64_t now)
 {
     m->phase = phase;
     m->phase_at = now;
-    m->moved_at = now;
+    m->encoder_motion_at = now;
     reset_control(m);
 }
 
@@ -445,6 +520,41 @@ static bool overspeed(Motor *m, float max_speed)
         m->fault_threshold = threshold;
     }
     return trip;
+}
+
+static float startup_step(const Motor *m, uint64_t now, int direction, float effort, float dt)
+{
+    if (now - m->encoder_motion_at < START_ASSIST_DELAY_US) {
+        return 0;
+    }
+    const float measured = direction > 0 ? m->breakaway_forward : m->breakaway_reverse;
+    const float rate = effort < measured ? MEASURED_START_ASSIST_RATE : START_ASSIST_RATE;
+    return rate * dt;
+}
+
+static float integrate_duty(float integral, float step, float base, float minimum, float maximum)
+{
+    const float effort = base + integral;
+    // Accept only the part of the increment that can change the applied duty.
+    return clamp(integral + clamp(step, fminf(0, -effort), fmaxf(0, maximum - effort)), minimum, maximum);
+}
+
+static bool stalled_at_limit(Motor *m, uint64_t now)
+{
+    const float limit = duty_limit(m);
+    if (limit <= 0 || fabsf(m->output) + .03f < limit || now - m->encoder_motion_at < START_ASSIST_DELAY_US) {
+        m->stalled_at = 0;
+        return false;
+    }
+    if (m->stalled_at == 0) {
+        m->stalled_at = now;
+    }
+    if (now - m->stalled_at < STALL_AT_LIMIT_US) {
+        return false;
+    }
+    m->fault_speed = m->output;
+    m->fault_threshold = limit;
+    return true;
 }
 
 static float calibration_update(unsigned i, uint64_t now, bool control_sample)
@@ -503,7 +613,7 @@ static float calibration_update(unsigned i, uint64_t now, bool control_sample)
     if (seeking && (m->raw & m->endpoint)) {
         return 0;
     }
-    if (now - m->moved_at > STALL_TIMEOUT_US) {
+    if (stalled_at_limit(m, now)) {
         trip_motor(i, STALLED);
         return 0;
     }
@@ -518,11 +628,10 @@ static float calibration_update(unsigned i, uint64_t now, bool control_sample)
         m->ref_velocity = motion_limits_enabled
             ? approach(m->ref_velocity, speed, m->cfg.acceleration * CONTROL_DT) : speed;
         const float error = m->ref_velocity - fabsf(m->velocity);
-        const float next_i = clamp(m->integral + 3.0f * CONTROL_DT * error, 0, m->cfg.duty);
         const float proportional = .75f * error;
-        if (proportional + next_i <= m->cfg.duty || error < 0) {
-            m->integral = next_i;
-        }
+        const float step = 3.0f * CONTROL_DT * error;
+        const float start = error > 0 ? startup_step(m, now, direction, proportional + m->integral, CONTROL_DT) : 0;
+        m->integral = integrate_duty(m->integral, step + start, proportional, 0, m->cfg.duty);
         m->requested = direction * clamp(m->integral + proportional, 0, m->cfg.duty);
     }
     return m->requested;
@@ -542,7 +651,6 @@ static bool capturing_position(Motor *m, uint64_t now)
             return true;
         }
         m->capture_at = 0;
-        m->reference = m->position;
         m->previous_angle = m->position;
         return false;
     }
@@ -550,7 +658,7 @@ static bool capturing_position(Motor *m, uint64_t now)
         return false;
     }
     m->capture_at = now;
-    m->ref_velocity = m->integral = m->derivative = m->velocity_target = 0;
+    m->integral = m->derivative = m->velocity_target = 0;
     reset_speed_pi(m);
     return true;
 }
@@ -562,10 +670,13 @@ static float speed_bound(float distance, const Motor *m)
     return fminf(speed_limit(m), sqrtf(2 * accel * fmaxf(0, distance) + reaction * reaction) - reaction);
 }
 
-static float speed_pi(Motor *m, uint64_t now, float target, float measured)
+static float speed_pi(Motor *m, uint64_t now, bool control_sample, float target, float measured)
 {
     if (fabsf(target) < .05f) {
-        reset_speed_pi(m);
+        if (m->speed_pi_at != 0 && now - m->speed_pi_at >= SPEED_PI_HOLD_US) {
+            reset_speed_pi(m);
+        }
+        m->speed_setpoint = m->requested = 0;
         return 0;
     }
     const int direction = target > 0 ? 1 : -1;
@@ -574,10 +685,10 @@ static float speed_pi(Motor *m, uint64_t now, float target, float measured)
         m->speed_direction = direction;
     }
     m->speed_setpoint = target;
-    if (m->speed_pi_at != 0 && now - m->speed_pi_at < SPEED_PI_PERIOD_US) {
+    if (!control_sample && m->speed_pi_at != 0) {
         return m->requested;
     }
-    const float dt = m->speed_pi_at == 0 ? 0 : (now - m->speed_pi_at) * 1e-6f;
+    const float dt = m->speed_pi_at == 0 ? 0 : fminf((now - m->speed_pi_at) * 1e-6f, 2 * CONTROL_DT);
     m->speed_pi_at = now;
     const float speed = fabsf(target);
     const float error = speed - direction * measured;
@@ -586,15 +697,14 @@ static float speed_pi(Motor *m, uint64_t now, float target, float measured)
     const float feedforward = friction * fminf(1, speed / FRICTION_BLEND_SPEED);
     const float base = feedforward + SPEED_PI_KP * error;
     const float step = SPEED_PI_KI * dt * error;
-    const float candidate = base + m->speed_integral + step;
-    if (!((candidate > max_duty && step > 0) || (candidate < 0 && step < 0))) {
-        m->speed_integral = clamp(m->speed_integral + step, -friction, max_duty);
-    }
+    // Add starting torque to the integral, so it remains available after the first encoder edges.
+    const float start = error > 0 ? startup_step(m, now, direction, base + m->speed_integral, dt) : 0;
+    m->speed_integral = integrate_duty(m->speed_integral, step + start, base, -friction, max_duty);
     m->requested = direction * clamp(base + m->speed_integral, 0, max_duty);
     return m->requested;
 }
 
-static void position_update(Motor *m, uint64_t now, float low, float high)
+static void reference_update(Motor *m, uint64_t now)
 {
     const float elapsed = (now - m->started_at) * 1e-6f;
     if (m->mode == SINE || m->mode == COSINE) {
@@ -606,14 +716,22 @@ static void position_update(Motor *m, uint64_t now, float low, float high)
     const float accel = acceleration_limit(m);
     if (limits_for_motion()) {
         const float distance = m->goal - m->reference;
+        const float remaining = fabsf(distance);
         const float half_step = 0.5f * accel * CONTROL_DT;
-        const float desired_speed = copysignf(fminf(speed_limit(m),
-            sqrtf(2 * accel * fabsf(distance) + half_step * half_step) - half_step), distance);
+        const float stopping_speed = sqrtf(2 * accel * remaining + half_step * half_step) - half_step;
+        const float desired_speed = copysignf(fminf(remaining / CONTROL_DT,
+            fminf(speed_limit(m), stopping_speed)), distance);
         m->ref_velocity = approach(m->ref_velocity, desired_speed, accel * CONTROL_DT);
-        m->reference = clamp(m->reference + m->ref_velocity * CONTROL_DT, 0, m->span);
+        const float minimum = ball_state == BALL_ACTIVE ? .01f * m->ball_min * m->span : 0;
+        const float maximum = ball_state == BALL_ACTIVE ? .01f * m->ball_max * m->span : m->span;
+        m->reference = clamp(m->reference + m->ref_velocity * CONTROL_DT, minimum, maximum);
     } else {
         m->reference = m->goal;
     }
+}
+
+static void position_update(Motor *m, float low, float high)
+{
     const float error = m->reference - m->position;
     const float proportional = m->cfg.kp * error;
     m->derivative = m->alpha * m->derivative - m->beta * (m->position - m->previous_angle);
@@ -627,12 +745,40 @@ static void position_update(Motor *m, uint64_t now, float low, float high)
     m->previous_angle = m->position;
     const float target = clamp(base + m->integral, low, high);
     m->velocity_target = limits_for_motion()
-        ? approach(m->velocity_target, target, accel * CONTROL_DT) : target;
+        ? approach(m->velocity_target, target, acceleration_limit(m) * CONTROL_DT) : target;
 }
 
 static void finish_level(LevelState state);
 static void level_update(uint64_t now);
 static void home_update(uint64_t now);
+static void ball_center_update(uint64_t now);
+
+static float pwm_test_update(unsigned i, uint64_t now)
+{
+    Motor *m = &motors[i];
+    if (now - pwm_test.received_at > PWM_TEST_TIMEOUT_US
+        || m->raw != 0 || m->position <= PWM_TEST_MARGIN_DEG
+        || m->position >= m->span - PWM_TEST_MARGIN_DEG
+        || fabsf(m->control_velocity) > m->cfg.speed) {
+        stop_all(BRAKE, NO_FAULT);
+        return 0;
+    }
+    const int64_t displacement = llabs(m->count - pwm_test.start_count);
+    if (displacement == 0) {
+        pwm_test.first_duty = 0;
+    } else if (pwm_test.first_duty == 0 && m->output != 0) {
+        pwm_test.first_duty = fabsf(m->output);
+    }
+    if (displacement >= 2) {
+        if (pwm_test.first_duty > 0
+            && (m->count - pwm_test.start_count) * encoder_direction(m) * pwm_test.direction > 0) {
+            pwm_test.state = PWM_FOUND;
+        }
+        stop_all(BRAKE, NO_FAULT);
+        return 0;
+    }
+    return pwm_test.direction * pwm_test.target;
+}
 
 static void update_motor(unsigned i, uint64_t now, bool control_sample)
 {
@@ -642,22 +788,49 @@ static void update_motor(unsigned i, uint64_t now, bool control_sample)
         motion_limits_enabled = true;
         stop_all(BRAKE, LINK_LOST);
     }
+    if (ball_running() && now - ball_command_at >= BALL_TIMEOUT_US) {
+        stop_all(BRAKE, NO_FAULT);
+        ball_state = BALL_TIMEOUT;
+    }
     m->raw = read_switches(&pins[i]);
     m->stable ^= (m->raw ^ m->stable) & ~(m->raw ^ m->previous_raw);
     m->previous_raw = m->raw;
     if (m->last_count != m->count) {
         m->last_count = m->count;
-        m->moved_at = now;
+        m->encoder_motion_at = now;
     }
     const int sign = encoder_direction(m);
-    const float speed = sign * m->velocity;
+    const float speed = sign * m->control_velocity;
     m->position = m->travel.captured == LIMIT_BOTH
         ? (float)(m->count - m->travel.min_count) * ENCODER_DEGREES_PER_COUNT * sign
         : (float)m->count * ENCODER_DEGREES_PER_COUNT;
 
     float duty = 0;
+    bool brake_at_zero = true;
+    const unsigned other = i == MOTOR_1 ? MOTOR_3 : MOTOR_1;
+    if (ball_state == BALL_ACTIVE && m->raw != 0) {
+        if (m->ball_switch_at == 0) {
+            m->ball_switch_at = now;
+        }
+    } else {
+        m->ball_switch_at = 0;
+    }
     if (m->raw == LIMIT_BOTH && (m->mode != BRAKE || m->fault != SWITCH_CONFLICT)) {
         trip_motor(i, SWITCH_CONFLICT);
+    } else if (m->ball_switch_at != 0 && now - m->ball_switch_at >= BALL_SWITCH_CONFIRM_US) {
+        trip_motor(i, BALL_ENDSTOP);
+    } else if (ball_state == BALL_ACTIVE && (m->position < .01f * m->ball_min * m->span - POSITION_RELEASE_DEG
+               || m->position > .01f * m->ball_max * m->span + POSITION_RELEASE_DEG)) {
+        trip_motor(i, BALL_OUTSIDE_WINDOW);
+    } else if (ball_state == BALL_ACTIVE && (m->raw != 0 || read_switches(&pins[other]) != 0)) {
+        // Brake immediately on a raw switch; only latch the fault if it persists.
+        neutral_output(i, true);
+        neutral_output(other, true);
+        reset_speed_pi(m);
+        m->velocity_target = 0;
+        m->guard_at = 0;
+        m->guard_excess = false;
+        m->stalled_at = 0;
     } else if (level_active() && m->raw != 0) {
         finish_level(LEVEL_TRAVEL);
     } else if (m->mode >= CALIBRATE
@@ -665,14 +838,19 @@ static void update_motor(unsigned i, uint64_t now, bool control_sample)
         trip_motor(i, ENCODER_STALE);
     } else if (m->mode == CALIBRATE) {
         duty = calibration_update(i, now, control_sample);
+        brake_at_zero = m->mode != CALIBRATE;
+    } else if (m->mode == PWM_TEST) {
+        duty = pwm_test_update(i, now);
     } else if (m->mode >= POSITION) {
         const bool fixed_goal = m->mode == POSITION || m->mode == STEP;
-        const float lower = fixed_goal ? m->goal : 0;
-        const float upper = fixed_goal ? m->goal : m->span;
+        const float minimum = ball_state == BALL_ACTIVE ? .01f * m->ball_min * m->span : 0;
+        const float maximum = ball_state == BALL_ACTIVE ? .01f * m->ball_max * m->span : m->span;
+        const float lower = fixed_goal ? fmaxf(minimum, m->goal) : minimum;
+        const float upper = fixed_goal ? fminf(maximum, m->goal) : maximum;
         const float min_speed = limits_for_motion() ? speed_bound(m->position - lower, m) : INFINITY;
         const float max_speed = limits_for_motion() ? speed_bound(upper - m->position, m) : INFINITY;
-        const float low = (m->raw & LIMIT_MIN) ? 0 : -min_speed;
-        const float high = (m->raw & LIMIT_MAX) ? 0 : max_speed;
+        const float low = (m->raw & LIMIT_MIN) || m->position <= minimum ? 0 : -min_speed;
+        const float high = (m->raw & LIMIT_MAX) || m->position >= maximum ? 0 : max_speed;
         if (m->mode == STEP) {
             m->step_elapsed = (now - m->started_at) * 1e-6f;
         }
@@ -687,29 +865,33 @@ static void update_motor(unsigned i, uint64_t now, bool control_sample)
             trip_motor(i, UNEXPECTED_SWITCH);
         } else if (m->mode == STEP && now - m->started_at >= STEP_DURATION_US) {
             m->mode = BRAKE;
-        } else if (capturing_position(m, now)) {
-            neutral_output(i, true);
-            m->moved_at = now;
         } else {
             if (control_sample) {
-                position_update(m, now, low, high);
+                reference_update(m, now);
             }
-            duty = speed_pi(m, now, clamp(m->velocity_target, low, high), speed);
-            if (fabsf(m->output) > 5 && fabsf(m->goal - m->position) > ENCODER_DEGREES_PER_COUNT
-                && now - m->moved_at > STALL_TIMEOUT_US) {
-                trip_motor(i, STALLED);
-                duty = 0;
-            } else if (fabsf(m->output) <= 5 || fabsf(m->goal - m->position) <= ENCODER_DEGREES_PER_COUNT) {
-                m->moved_at = now;
+            if (capturing_position(m, now)) {
+                m->stalled_at = 0;
+            } else {
+                if (control_sample) {
+                    position_update(m, low, high);
+                }
+                duty = speed_pi(m, now, control_sample, clamp(m->velocity_target, low, high), speed);
+                brake_at_zero = m->position <= minimum || m->position >= maximum;
+                if (stalled_at_limit(m, now)) {
+                    trip_motor(i, STALLED);
+                    duty = 0;
+                }
             }
         }
     }
-    bridge_output(i, duty, now);
+    bridge_output(i, duty, brake_at_zero, now);
     if (i == MOTOR_1 && control_sample) {
         if (level_active()) {
             level_update(now);
         } else if (home_state == HOME_MOVING) {
             home_update(now);
+        } else if (ball_state == BALL_CENTERING) {
+            ball_center_update(now);
         }
     }
     m->report_at = now;
@@ -820,7 +1002,7 @@ static void start_motion(Motor *m, Mode mode, float goal, float amplitude, float
     m->mode = mode;
     m->fault = NO_FAULT;
     m->started_at = now;
-    m->moved_at = now;
+    m->encoder_motion_at = now;
     m->goal = goal;
     m->previous_goal_error = goal - m->position;
     m->baseline = mode == STEP ? goal - 1 : goal;
@@ -1128,6 +1310,106 @@ static bool motors_stationary(void)
     return true;
 }
 
+static void ball_center_update(uint64_t now)
+{
+    if (now - ball_center_started_at > HOME_TIMEOUT_US) {
+        const unsigned i = fabsf(motors[MOTOR_1].position - home_goal(&motors[MOTOR_1]))
+            >= fabsf(motors[MOTOR_3].position - home_goal(&motors[MOTOR_3])) ? MOTOR_1 : MOTOR_3;
+        trip_motor(i, BALL_CENTER_TIMEOUT);
+        return;
+    }
+    bool centered = motors_stationary();
+    for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
+        centered &= fabsf(motors[i].position - home_goal(&motors[i])) <= POSITION_RELEASE_DEG;
+    }
+    if (!centered) {
+        ball_center_quiet_at = 0;
+    } else if (ball_center_quiet_at == 0) {
+        ball_center_quiet_at = now;
+    } else if (now - ball_center_quiet_at >= HOME_SETTLE_US) {
+        ball_state = BALL_ACTIVE;
+    }
+}
+
+static const char *begin_ball(const float *limits, uint64_t now)
+{
+    if (!motors_stationary()) {
+        return "freio_necessario";
+    }
+    for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
+        const Motor *m = &motors[i];
+        if (limits[3 * i] < BALL_TRAVEL_MIN || limits[3 * i] >= HOME_PERCENT
+            || limits[3 * i + 1] <= HOME_PERCENT || limits[3 * i + 1] > BALL_TRAVEL_MAX) {
+            return "faixa_bola_invalida";
+        }
+        if (limits[3 * i + 2] <= 0 || limits[3 * i + 2] > 100) {
+            return "pwm_bola_invalido";
+        }
+        if (m->travel.captured != LIMIT_BOTH || m->span <= 0) {
+            return "home_requer_curso";
+        }
+        if (m->sampled_at == 0 || now - m->sampled_at > 3u * SAMPLE_US) {
+            return "home_requer_encoder";
+        }
+        if (read_switches(&pins[i]) == LIMIT_BOTH) {
+            return "fins_simultaneos";
+        }
+        if (m->position < -POSITION_RELEASE_DEG || m->position > m->span + POSITION_RELEASE_DEG) {
+            return "bola_fora_do_curso";
+        }
+        const char *error = position_config_error(m);
+        if (error) {
+            return error;
+        }
+    }
+    stop_all(BRAKE, NO_FAULT);
+    ball_fault.fault = NO_FAULT;
+    ball_state = BALL_CENTERING;
+    ball_command_at = now;
+    ball_center_started_at = now;
+    ball_center_quiet_at = 0;
+    for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
+        Motor *m = &motors[i];
+        m->ball_min = limits[3 * i];
+        m->ball_max = limits[3 * i + 1];
+        m->ball_duty = limits[3 * i + 2];
+        start_motion(m, POSITION, home_goal(m), 0, 0, now);
+    }
+    return NULL;
+}
+
+static const char *update_ball_targets(const float *percent, uint64_t now)
+{
+    if (!ball_running()) {
+        return "bola_inativa";
+    }
+    if (now - ball_command_at >= BALL_TIMEOUT_US) {
+        stop_all(BRAKE, NO_FAULT);
+        ball_state = BALL_TIMEOUT;
+        return "bola_inativa";
+    }
+    for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
+        if (percent[i] < motors[i].ball_min || percent[i] > motors[i].ball_max) {
+            trip_motor(i, BALL_INVALID_TARGET);
+            return "bola_fora_da_faixa";
+        }
+    }
+    ball_command_at = now;
+    if (ball_state == BALL_CENTERING) {
+        return NULL;
+    }
+    for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
+        Motor *m = &motors[i];
+        // The position controller already limits the reference speed and acceleration.
+        const float target = (percent[i] / 100.0f) * m->span;
+        if (target != m->goal) {
+            m->goal = target;
+            m->previous_goal_error = target - m->position;
+        }
+    }
+    return NULL;
+}
+
 static const char *dispatch(const char *cmd, const float *v, size_t n, uint64_t now)
 {
     if (strcmp(cmd, "STOP") == 0 && n == 0) {
@@ -1137,6 +1419,13 @@ static const char *dispatch(const char *cmd, const float *v, size_t n, uint64_t 
     if (!linked) {
         return "sem_sessao";
     }
+    if (strcmp(cmd, "PWMVAL") == 0 && n == 2) {
+        if (pwm_test.state == PWM_RUNNING && v[0] == motor_number(pwm_test.motor)) {
+            pwm_test.target = clamp(v[1], 0, motors[pwm_test.motor].cfg.duty);
+            pwm_test.received_at = now;
+        }
+        return NULL;
+    }
     if (strcmp(cmd, "PING") == 0 && n == 0) {
         last_heartbeat = now;
         return NULL;
@@ -1144,11 +1433,23 @@ static const char *dispatch(const char *cmd, const float *v, size_t n, uint64_t 
     if (strcmp(cmd, "IMUGET") == 0 && n == 0) {
         return NULL;
     }
+    if (strcmp(cmd, "BALL") == 0 && n == MOTOR_COUNT) {
+        return update_ball_targets(v, now);
+    }
+    if (strcmp(cmd, "BALLSTATUS") == 0 && n == 0) {
+        return NULL;
+    }
+    if (ball_running() && strcmp(cmd, "COAST") != 0) {
+        return "bola_em_andamento";
+    }
     if (home_state == HOME_MOVING && strcmp(cmd, "COAST") != 0) {
         return "home_em_andamento";
     }
     if (level_active()) {
         return "nivelamento_em_andamento";
+    }
+    if (pwm_test.state == PWM_RUNNING && strcmp(cmd, "COAST") != 0) {
+        return "teste_pwm_em_andamento";
     }
     if (strcmp(cmd, "LEVEL") == 0 && n == 0) {
         return begin_level(now);
@@ -1203,21 +1504,24 @@ static const char *dispatch(const char *cmd, const float *v, size_t n, uint64_t 
     if (strcmp(cmd, "HOME") == 0 && n == 0) {
         return begin_home(now);
     }
-    if (strcmp(cmd, "CAL") == 0 && n == 0) {
+    if (strcmp(cmd, "BALLSTART") == 0) {
+        return n == 3 * MOTOR_COUNT ? begin_ball(v, now) : "faixa_bola_invalida";
+    }
+    if (strcmp(cmd, "CAL") == 0 && (n == 0 || (n == 1 && v[0] == 3))) {
         if (read_switches(&pins[MOTOR_1]) != 0 || read_switches(&pins[MOTOR_3]) != 0) {
             return "libere_os_fins_de_curso";
         }
         if (motors[MOTOR_1].mode > BRAKE || motors[MOTOR_3].mode > BRAKE) {
             return "freio_necessario";
         }
-        if (motors[MOTOR_1].cfg.duty == 0 || motors[MOTOR_3].cfg.duty == 0) {
+        if ((n == 0 && motors[MOTOR_1].cfg.duty == 0) || motors[MOTOR_3].cfg.duty == 0) {
             return "pwm_zerado";
         }
         invalidate_travel(&motors[MOTOR_3]);
         leveling.state = LEVEL_IDLE;
         home_state = HOME_IDLE;
         motors[MOTOR_3].fault = NO_FAULT;
-        begin_calibration(&motors[MOTOR_1], now);
+        begin_calibration(&motors[n == 0 ? MOTOR_1 : MOTOR_3], now);
         return NULL;
     }
     if (strcmp(cmd, "CIRCLE") == 0 && n == 2) {
@@ -1243,6 +1547,36 @@ static const char *dispatch(const char *cmd, const float *v, size_t n, uint64_t 
     }
     const unsigned i = v[0] == 1 ? MOTOR_1 : MOTOR_3;
     Motor *m = &motors[i];
+    if (strcmp(cmd, "PWMSTART") == 0 && n == 2 && (v[1] == 1 || v[1] == -1)) {
+        if (!motors_stationary()) {
+            return "freio_necessario";
+        }
+        if (m->travel.captured != LIMIT_BOTH || m->position <= PWM_TEST_MARGIN_DEG
+            || m->position >= m->span - PWM_TEST_MARGIN_DEG || read_switches(&pins[i]) != 0) {
+            return "teste_pwm_requer_curso";
+        }
+        if (m->sampled_at == 0 || now - m->sampled_at > 3u * SAMPLE_US) {
+            return "home_requer_encoder";
+        }
+        if (m->cfg.duty == 0) {
+            return "pwm_zerado";
+        }
+        stop_all(BRAKE, NO_FAULT);
+        m->mode = PWM_TEST;
+        m->fault = NO_FAULT;
+        pwm_test.motor = i;
+        pwm_test.direction = (int)v[1];
+        pwm_test.start_count = m->count;
+        pwm_test.received_at = now;
+        pwm_test.target = pwm_test.first_duty = 0;
+        pwm_test.state = PWM_RUNNING;
+        return NULL;
+    }
+    if (strcmp(cmd, "FRICTION") == 0 && n == 3 && v[1] >= 0 && v[1] <= 100 && v[2] >= 0 && v[2] <= 100) {
+        m->breakaway_forward = v[1];
+        m->breakaway_reverse = v[2];
+        return NULL;
+    }
     if (strcmp(cmd, "CFG") == 0 && n == 12) {
         if (!valid_settings(v + 1)) {
             return "configuracao_fora_da_faixa";
@@ -1350,11 +1684,13 @@ void motor_command(char *line)
         const Settings m1 = motors[MOTOR_1].cfg;
         const Settings m3 = motors[MOTOR_3].cfg;
         const HomeState home = home_state;
+        ball_state = BALL_IDLE;
         xSemaphoreGive(lock);
-        puts("!HELLO,8");
+        puts("!HELLO,12");
         printf("!SCALE,%.7g\n", ENCODER_DEGREES_PER_COUNT);
         puts("!LIMITS,1");
         printf("!HOME,%u\n", (unsigned)home);
+        puts("!BALL,0");
         imu_send_reference();
         print_settings(MOTOR_1, m1);
         print_settings(MOTOR_3, m3);
@@ -1370,6 +1706,7 @@ void motor_command(char *line)
     const unsigned i = cfg && values[0] == 3 ? MOTOR_3 : MOTOR_1;
     const Settings settings = motors[i].cfg;
     const bool limits_enabled = motion_limits_enabled;
+    const BallState ball = ball_state;
     xSemaphoreGive(lock);
     if (error && strcmp(cmd, "CFG") == 0 && n >= 1 && (values[0] == 1 || values[0] == 3)) {
         printf("!ERR,CFG,%s,%u\n", error, (unsigned)values[0]);
@@ -1379,9 +1716,11 @@ void motor_command(char *line)
         print_settings(i, settings);
     } else if (strcmp(cmd, "LIMITS") == 0) {
         printf("!LIMITS,%u\n", (unsigned)limits_enabled);
+    } else if (strcmp(cmd, "BALLSTATUS") == 0) {
+        printf("!BALL,%u\n", (unsigned)ball);
     } else if (strcmp(cmd, "IMUZERO") == 0 || strcmp(cmd, "IMUCFG") == 0 || strcmp(cmd, "IMUGET") == 0) {
         imu_send_reference();
-    } else if (strcmp(cmd, "PING") != 0) {
+    } else if (strcmp(cmd, "PING") != 0 && strcmp(cmd, "BALL") != 0 && strcmp(cmd, "PWMVAL") != 0) {
         printf("!OK,%s\n", cmd);
     }
 }
@@ -1395,15 +1734,17 @@ void motor_send_updates(void)
         const uint64_t at = m->report_at;
         const float position = m->position, goal = m->goal, reference = m->reference;
         const float span = m->span, duty = m->output;
-        const float speed = m->travel.captured == LIMIT_BOTH ? encoder_direction(m) * m->velocity : m->velocity;
+        const float measured = m->mode >= POSITION ? m->control_velocity : m->velocity;
+        const float speed = m->travel.captured == LIMIT_BOTH ? encoder_direction(m) * measured : measured;
         const unsigned mode = m->mode, fault = m->fault, travel = m->travel.captured, raw = m->raw;
         const unsigned phase = m->phase, endpoint = m->endpoint;
         const uint32_t step_id = m->step_id;
         const float elapsed = m->step_elapsed;
         const int enable_level = mode <= COAST ? (int)gpio_get(pins[i].enable) : -1;
-        const float fault_speed = fault == OVERSPEED ? m->fault_speed : 0;
-        const float fault_threshold = fault == OVERSPEED ? m->fault_threshold : 0;
-        const float speed_setpoint = mode >= POSITION ? m->speed_setpoint : 0;
+        const float fault_speed = fault == OVERSPEED || fault == STALLED ? m->fault_speed : 0;
+        const float fault_threshold = fault == OVERSPEED || fault == STALLED ? m->fault_threshold : 0;
+        // Before calibration the encoder sign relative to the course may be unknown.
+        const float speed_setpoint = mode == CALIBRATE ? m->ref_velocity : m->speed_setpoint;
         xSemaphoreGive(lock);
         if (at == last_report[i]) {
             continue;
@@ -1417,19 +1758,39 @@ void motor_send_updates(void)
     static uint64_t last_level_report;
     static LevelState last_level_state;
     static HomeState last_home_state;
+    static BallState last_ball_state;
+    static PwmTestState last_pwm_state;
     xSemaphoreTake(lock, portMAX_DELAY);
     const LevelState state = leveling.state;
     const HomeState home = home_state;
+    const BallState ball = ball_state;
+    const BallFault fault = ball_fault;
+    const PwmTestState pwm_state = pwm_test.state;
+    const unsigned pwm_motor = motor_number(pwm_test.motor);
+    const int pwm_direction = pwm_test.direction;
+    const float pwm_duty = pwm_test.first_duty;
     const float tilt = state == LEVEL_IDLE ? -1 : leveling.tilt;
     const float m1 = leveling.result[MOTOR_1];
     const float m3 = leveling.result[MOTOR_3];
     const uint64_t now = time_us_64();
     xSemaphoreGive(lock);
-    if (state != last_level_state || home != last_home_state || now - last_level_report >= 250000u) {
+    if (pwm_state != last_pwm_state) {
+        last_pwm_state = pwm_state;
+        printf("!PWMTEST,%u,%u,%d,%.2f\n", pwm_motor, (unsigned)pwm_state, pwm_direction, pwm_duty);
+    }
+    if (state != last_level_state || home != last_home_state || ball != last_ball_state
+        || now - last_level_report >= 250000u) {
         last_level_report = now;
         last_level_state = state;
         last_home_state = home;
+        last_ball_state = ball;
         printf("!LEVEL,%u,%.2f,%.2f,%.2f\n", (unsigned)state, tilt, m1, m3);
         printf("!HOME,%u\n", (unsigned)home);
+        if (ball == BALL_MOTOR && fault.fault != NO_FAULT) {
+            printf("!BALLF,%u,%u,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+                   fault.motor, (unsigned)fault.fault, fault.position, fault.target,
+                   fault.duty, fault.speed, fault.threshold);
+        }
+        printf("!BALL,%u\n", (unsigned)ball);
     }
 }

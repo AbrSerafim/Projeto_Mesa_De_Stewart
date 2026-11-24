@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 from tempfile import NamedTemporaryFile
 from threading import Event, Thread
+from time import monotonic
 import tkinter as tk
 from tkinter import ttk
 from typing import NamedTuple
@@ -12,10 +13,13 @@ from uuid import uuid4
 
 from PIL import Image, ImageTk
 
-from yolo_detection import EXAMPLE_CLASSES, CameraDetector
+from ball_control import MAX_AGE, BallControl, ball_center
+from yolo_detection import CUSTOM_WEIGHTS, EXAMPLE_CLASSES, CameraDetector
 
 
 PHOTO_DIRECTORY = Path(__file__).resolve().parent / "fotos yolo"
+STANDARD_MODEL = "YOLO26n (COCO)"
+CUSTOM_MODEL = "best.pt (bola)"
 
 
 class CaptureMode(NamedTuple):
@@ -65,13 +69,18 @@ def save_photo(cv2, frame):
 class CameraCapture:
     def __init__(self, index):
         self.index = index
-        self.latest = None
+        self.latest_sample = None
         self.error = ""
         self.photo_requested = Event()
         self.photo_result = ""
         self.stop = Event()
         self.thread = Thread(target=self.run, name="camera-preview", daemon=True)
         self.thread.start()
+
+    @property
+    def latest(self):
+        sample = self.latest_sample
+        return sample[0] if sample is not None else None
 
     def run(self):
         try:
@@ -89,7 +98,7 @@ class CameraCapture:
         photo_mode = False
         try:
             while frame is not None and not self.stop.is_set():
-                self.latest = frame
+                self.latest_sample = (frame, monotonic())
                 if self.photo_requested.is_set():
                     if not photo_mode:
                         height, width = frame.shape[:2]
@@ -103,7 +112,7 @@ class CameraCapture:
                                 self.photo_requested.clear()
                                 break
                             camera, frame = stream
-                            self.latest = frame
+                            self.latest_sample = (frame, monotonic())
                         photo_mode = True
                     if not self.stop.is_set():
                         self.take_photo(cv2, frame)
@@ -216,6 +225,8 @@ class CameraView:
         self.photo = None
         self.preview_bounds = None
         self.preview_dimensions = None
+        self.crop = None
+        self.raw_frame = self.vision_frame = None
         self.setpoint = None
         self.last_device = None
         self.space_down = False
@@ -230,12 +241,18 @@ class CameraView:
         self.status = tk.StringVar(value="Câmera fechada")
         ttk.Label(controls, textvariable=self.status).pack(side="left", padx=10)
         self.detecting = tk.BooleanVar(value=True)
-        detect_check = ttk.Checkbutton(controls, text="YOLO26n", variable=self.detecting,
+        detect_check = ttk.Checkbutton(controls, text="YOLO", variable=self.detecting,
                                        command=self.change_detection)
         detect_check.pack(side="left", padx=(8, 5))
+        self.yolo_model = tk.StringVar(value=STANDARD_MODEL)
+        model_box = ttk.Combobox(controls, textvariable=self.yolo_model, values=(STANDARD_MODEL, CUSTOM_MODEL),
+                                 width=15, state="readonly")
+        model_box.pack(side="left", padx=(0, 6))
+        model_box.bind("<<ComboboxSelected>>", self.change_model)
         ttk.Label(controls, text="Classe").pack(side="left")
         self.classes = EXAMPLE_CLASSES
         self.selected_class = tk.StringVar(value=EXAMPLE_CLASSES[0])
+        self.custom_class = tk.StringVar(value="bola")
         self.class_box = ttk.Combobox(controls, textvariable=self.selected_class, values=self.classes,
                                       width=17, state="readonly")
         self.class_box.pack(side="left", padx=5)
@@ -246,6 +263,14 @@ class CameraView:
         aruco_toggle.pack(side="left", padx=(6, 4))
         self.detection_status = tk.StringVar()
         ttk.Label(controls, textvariable=self.detection_status).pack(side="left", padx=5)
+        threshold_controls = ttk.Frame(parent, padding=(8, 0, 8, 5))
+        threshold_controls.pack(fill="x")
+        ttk.Label(threshold_controls, text="Confiança mínima YOLO").pack(side="left")
+        self.confidence = tk.DoubleVar(value=20)
+        self.confidence_label = tk.StringVar()
+        threshold_slider = ttk.Scale(threshold_controls, from_=1, to=99, variable=self.confidence, length=160)
+        threshold_slider.pack(side="left", padx=6)
+        ttk.Label(threshold_controls, textvariable=self.confidence_label, width=5).pack(side="left")
 
         setpoint_controls = ttk.Frame(parent, padding=(8, 0, 8, 6))
         setpoint_controls.pack(fill="x")
@@ -263,7 +288,19 @@ class CameraView:
         self.photo_status = tk.StringVar()
         ttk.Label(photo_controls, textvariable=self.photo_status).pack(side="left", padx=10)
 
-        self.canvas = tk.Canvas(parent, bg="#101216", highlightthickness=0, cursor="crosshair")
+        ball_toolbar = ttk.Frame(parent, padding=(8, 0, 8, 6))
+        ball_toolbar.pack(fill="x")
+        body = ttk.Frame(parent)
+        body.pack(fill="both", expand=True)
+        left = ttk.Frame(body, padding=(8, 0, 4, 0))
+        right = ttk.Frame(body, padding=(4, 0, 8, 0))
+        left.pack(side="left", fill="y")
+        right.pack(side="right", fill="y")
+        self.ball = BallControl(left, right, ball_toolbar, self.confidence)
+        threshold_slider.configure(command=self.change_confidence)
+        self.confidence_label.set(f"{self.confidence.get():.0f}%")
+        background = ttk.Style(parent).lookup("TFrame", "background") or "#f0f0f0"
+        self.canvas = tk.Canvas(body, bg=background, highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
         self.preview = self.canvas.create_image(0, 0)
         for color, width in (("#151515", 4), ("#ff3030", 2)):
@@ -276,12 +313,47 @@ class CameraView:
         root.bind("<KeyRelease-space>", self.release_space, add="+")
         root.bind("<FocusOut>", self.release_space, add="+")
         # Run the camera shortcut before controls interpret Space as button activation.
-        for widget in (self.toggle, self.index, detect_check, self.class_box, aruco_toggle,
-                       self.clear_button, self.photo_button):
+        axis_widgets = tuple(widget for axis in self.ball.panels for widget in axis.frame.winfo_children())
+        for widget in (self.toggle, self.index, detect_check, model_box, self.class_box, aruco_toggle, threshold_slider,
+                       self.clear_button, self.photo_button, self.ball.button, self.ball.apply_button,
+                       self.ball.save_button, *axis_widgets):
             widget.bindtags((str(root), *(tag for tag in widget.bindtags() if tag != str(root))))
 
     def resize(self, _event):
         self.rendered = None
+
+    def change_confidence(self, value):
+        self.confidence_label.set(f"{float(value):.0f}%")
+        self.change_detection()
+
+    def ball_class_selected(self):
+        return self.detecting.get() and (self.yolo_model.get() == CUSTOM_MODEL
+                                         or self.selected_class.get() == "sports ball")
+
+    def prepare_ball(self, check_pico):
+        if not self.visible() or self.capture is None or self.capture.stop.is_set():
+            return "Abra a câmera primeiro."
+        if not self.ball_class_selected():
+            return "Ative YOLO com best.pt (bola) ou sports ball."
+        if self.setpoint is None:
+            return "Marque o setpoint na imagem."
+        return check_pico()
+
+    def useful_frame(self, raw):
+        if raw is not self.raw_frame:
+            width = raw.shape[1]
+            if self.crop is None:
+                # Only trim contiguous nearly black columns at the two image edges.
+                import numpy as np
+
+                columns = np.mean(np.max(raw, axis=2) <= 16, axis=0)
+                useful = np.flatnonzero(columns < .98)
+                if useful.size and useful[-1] - useful[0] >= width * .60:
+                    self.crop = (int(useful[0]), int(useful[-1]) + 1)
+            start, end = self.crop or (0, width)
+            self.raw_frame = raw
+            self.vision_frame = raw if (start, end) == (0, width) else raw[:, start:end]
+        return self.vision_frame
 
     def request_photo(self):
         capture = self.capture
@@ -333,15 +405,19 @@ class CameraView:
     def clear_preview(self):
         self.canvas.itemconfigure(self.preview, image="")
         self.canvas.itemconfigure("crosshair", state="hidden")
-        self.canvas.delete("detection", "aruco", "setpoint")
+        self.canvas.delete("detection", "aruco", "setpoint", "disparity")
         self.preview_bounds = None
         self.preview_dimensions = None
+        self.crop = None
+        self.raw_frame = self.vision_frame = None
         self.photo = self.rendered = None
 
     def clear_detection(self):
+        self.ball.stop("Autocorreção parada · detecção interrompida")
+        self.ball.frame_at = self.ball.observation = None
         self.submitted = self.shown_result = None
         self.detection_status.set("")
-        self.canvas.delete("detection", "aruco")
+        self.canvas.delete("detection", "aruco", "disparity")
         if self.detector is not None:
             self.detector.clear()
 
@@ -352,6 +428,20 @@ class CameraView:
                                          or (self.aruco_enabled.get() and self.detector.aruco_error)):
             self.detector.close()
             self.detector = None
+
+    def change_model(self, _event=None):
+        self.clear_detection()
+        self.rendered = None
+        if self.detector is not None:
+            self.detector.close()
+            self.detector = None
+        if self.yolo_model.get() == CUSTOM_MODEL:
+            self.custom_class.set("bola")
+            self.class_box.configure(textvariable=self.custom_class, values=(), state="disabled")
+            self.classes = ()
+        else:
+            self.classes = EXAMPLE_CLASSES
+            self.class_box.configure(textvariable=self.selected_class, values=self.classes, state="readonly")
 
     def pick_setpoint(self, event):
         if self.preview_bounds is None:
@@ -365,8 +455,9 @@ class CameraView:
         self.draw_setpoint()
 
     def clear_setpoint(self):
+        self.ball.stop("Autocorreção parada · setpoint removido")
         self.setpoint = None
-        self.canvas.delete("setpoint")
+        self.canvas.delete("setpoint", "disparity")
         self.setpoint_status.set("Clique na imagem para marcar o setpoint")
         self.clear_button.configure(state="disabled")
 
@@ -375,9 +466,18 @@ class CameraView:
         return left + u * (right - left), top + v * (bottom - top)
 
     def draw_setpoint(self):
-        self.canvas.delete("setpoint")
+        self.canvas.delete("setpoint", "disparity")
         if self.setpoint is not None and self.preview_bounds is not None:
             x, y = self.image_point(*self.setpoint)
+            result = self.shown_result
+            if (self.ball_class_selected() and result is not None and result.frame is self.rendered
+                    and monotonic() - result.captured_at <= MAX_AGE):
+                center = ball_center(result.boxes)
+                if center is not None and center != self.setpoint:
+                    start_x, start_y = self.image_point(*center)
+                    for color, width in (("#111111", 5), ("#ffdb48", 2)):
+                        self.canvas.create_line(start_x, start_y, x, y, fill=color, width=width,
+                                                arrow="last", arrowshape=(10, 13, 5), tags="disparity")
             self.canvas.create_oval(x - 8, y - 8, x + 8, y + 8, outline="#111111", width=4, tags="setpoint")
             self.canvas.create_oval(x - 8, y - 8, x + 8, y + 8, outline="#51eaff", width=2, tags="setpoint")
             self.canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#51eaff", outline="", tags="setpoint")
@@ -438,24 +538,29 @@ class CameraView:
         self.draw_detections(boxes)
         self.draw_aruco(markers)
         self.canvas.tag_raise("crosshair")
-        self.draw_setpoint()
         self.rendered = frame
         self.rendered_boxes = boxes
         self.rendered_markers = markers
+        self.draw_setpoint()
 
-    def detected_frame(self, latest):
-        class_name = self.selected_class.get() if self.detecting.get() else None
+    def detected_frame(self, latest, captured_at=None):
+        custom_model = self.yolo_model.get() == CUSTOM_MODEL
+        class_name = None
+        if self.detecting.get():
+            class_name = "" if custom_model else self.selected_class.get()
         aruco_enabled = self.aruco_enabled.get()
         if class_name is None and not aruco_enabled:
             return latest, (), ()
         if self.detector is None:
-            self.detector = CameraDetector()
+            self.detector = CameraDetector(weights=CUSTOM_WEIGHTS if custom_model else None)
         detector = self.detector
         if self.classes != detector.names:
             self.classes = detector.names
             self.class_box.configure(values=self.classes)
+            if custom_model and self.classes:
+                self.custom_class.set(self.classes[0])
         if latest is not self.submitted:
-            detector.submit(latest, class_name, aruco_enabled)
+            detector.submit(latest, class_name, aruco_enabled, self.confidence.get() / 100, captured_at)
             self.submitted = latest
         result = detector.result
         if result is not None and result.class_name == class_name and result.aruco_enabled == aruco_enabled:
@@ -469,7 +574,7 @@ class CameraView:
                 self.detection_status.set(" · ".join(status))
                 self.shown_result = result
             return result.frame, result.boxes, result.markers
-        self.detection_status.set("Carregando YOLO26n…" if class_name is not None and not detector.loaded
+        self.detection_status.set(f"Carregando {detector.model_name}…" if class_name is not None and not detector.loaded
                                   else "Processando…")
         return latest, (), ()
 
@@ -496,24 +601,35 @@ class CameraView:
         self.photo_button.state(["!disabled"] if capture.latest is not None and not capture.stop.is_set()
                                 and not capture.photo_requested.is_set() else ["disabled"])
         if not capture.stop.is_set() and self.visible():
-            frame = capture.latest
-            if frame is not None:
+            sample = capture.latest_sample
+            if sample is not None:
+                frame, captured_at = sample
                 height, width = frame.shape[:2]
                 if self.preview_dimensions != (width, height):
                     if self.preview_dimensions is not None:
                         self.clear_detection()
                         self.clear_setpoint()
+                    self.crop = None
+                    self.raw_frame = None
                     self.preview_dimensions = (width, height)
                     self.status.set(f"Câmera {capture.index} · {width} × {height}")
-                frame, boxes, markers = self.detected_frame(frame)
+                frame, boxes, markers = self.detected_frame(self.useful_frame(frame), captured_at)
                 if frame is not self.rendered or boxes != self.rendered_boxes or markers != self.rendered_markers:
                     self.render(frame, boxes, markers)
+            detector_ok = (self.ball_class_selected() and self.detector is not None and self.detector.loaded
+                           and not self.detector.error)
+            now = monotonic()
+            result = self.shown_result if detector_ok else None
+            if (result is None or now - result.captured_at > MAX_AGE) and self.canvas.find_withtag("disparity"):
+                self.canvas.delete("disparity")
+            self.ball.update(now, result, self.setpoint)
         elif self.submitted is not None:
             self.clear_detection()
             self.rendered = None
         self.parent.after(12, self.tick)
 
     def close(self):
+        self.ball.stop("Autocorreção encerrada")
         if self.capture is not None:
             self.capture.stop.set()
         if self.detector is not None:

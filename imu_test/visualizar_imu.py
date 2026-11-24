@@ -14,7 +14,7 @@ import numpy as np
 import serial
 from serial.tools import list_ports
 from camera_view import CameraView
-from controle_motores import LOCAL_GRAVITY, PROTOCOL_HELLO, MotorTab, SerialSession
+from controle_motores import LEGACY_HELLOS, LOCAL_GRAVITY, PROTOCOL_HELLO, MotorTab, SerialSession
 
 
 HISTORY_SECONDS = 10
@@ -261,8 +261,6 @@ def visualize():
     tabs.add(motors_tab, text="Encoders e fins de curso")
     tabs.add(drive_tab, text="Acionamento")
     tabs.add(camera_tab, text="Câmera")
-    camera_home = ttk.Frame(camera_tab, padding=(8, 6, 8, 0))
-    camera_home.pack(fill="x")
     camera = CameraView(camera_tab, lambda: tabs.select() == str(camera_tab))
     motor_panels = [MotorPanel(motors_tab, motor) for motor in (1, 3)]
     for column, panel in enumerate(motor_panels):
@@ -305,9 +303,23 @@ def visualize():
     session = None
     drive = MotorTab(drive_tab, lambda command: session.send(command) if session else None)
     drive.add_level_controls(imu_actions)
-    camera_home_button = drive.add_home_control(camera_home)
-    camera_home_button.bind("<KeyPress-space>", lambda event: camera.photo_shortcut(event) or "break")
-    window.bind("<Escape>", lambda _event: session.send("STOP") if session else None)
+
+    def prepare_ball():
+        if session is None or not drive.ready:
+            return "Conecte o Pico e aguarde a sincronização."
+        if not drive.check_applied((1, 3)):
+            return drive.message.get()
+        return None
+
+    camera.ball.send = lambda command: session.send(command) if session else None
+    camera.ball.prepare = lambda: camera.prepare_ball(prepare_ball)
+
+    def stop_motion(_event):
+        camera.ball.stop("Autocorreção parada", send=False)
+        if session is not None:
+            session.send("STOP")
+
+    window.bind("<Escape>", stop_motion)
     last_sample_at = None
     last_packet_at = None
     latest_imu = None
@@ -321,6 +333,7 @@ def visualize():
         history.clear()
         motor_history.clear()
         drive.reset()
+        camera.ball.disconnect()
         next_draw = 0
         last_sample_at = None
         last_packet_at = None
@@ -353,6 +366,7 @@ def visualize():
             session.close()
         session = SerialSession(new_port, SerialLines())
         reset_stream()
+        camera.ball.connected(monotonic())
         status.set(f"{session.device} — {message}")
 
     def show_ports():
@@ -399,12 +413,21 @@ def visualize():
         samples = []
         motor_samples = []
         latest = None
+        for _ in range(len(session.ball_sent)):
+            camera.ball.record_sent(*session.ball_sent.popleft())
         for _ in range(min(len(session.incoming), 512)):
             line = session.incoming.popleft()
-            if line in (PROTOCOL_HELLO, b"!HELLO,7") or line.startswith(b"accelx_mps2,"):
+            if line in (PROTOCOL_HELLO, *LEGACY_HELLOS[6:]) or line.startswith(b"accelx_mps2,"):
                 acceleration_si = True
             if line.startswith((b"@", b"!")):
-                drive.receive(line)
+                if line == PROTOCOL_HELLO or line in LEGACY_HELLOS:
+                    camera.ball.connected(now, compatible=line == PROTOCOL_HELLO)
+                elif line == b"!ERR,PING,sem_sessao":
+                    camera.ball.disconnect()
+                camera.ball.receive(line)
+                motor_sample = drive.receive(line)
+                if motor_sample is not None:
+                    camera.ball.record_reference(now, motor_sample)
             elif line.startswith(b"#"):
                 history.clear()
                 last_sample_at = None
@@ -429,6 +452,8 @@ def visualize():
                         sample = tuple(value * 9.80665 for value in sample[:3]) + sample[3:]
                     samples.append(sample)
         drive.check_sync(now)
+        drive.tick_pwm(now, tabs.select() == str(drive_tab))
+        camera.ball.check_connection(now)
 
         if motor_samples:
             previous = motor_history[-1][0] if motor_history else None

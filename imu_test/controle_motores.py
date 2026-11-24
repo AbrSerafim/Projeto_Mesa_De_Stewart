@@ -1,6 +1,7 @@
 """Comunicação e interface de acionamento dos motores da mesa."""
 
 from collections import deque
+import json
 from math import isclose, isfinite
 from pathlib import Path
 from queue import Empty, Queue
@@ -14,27 +15,34 @@ from matplotlib.figure import Figure
 
 
 MOTORS = (1, 3)
-PROTOCOL_HELLO = b"!HELLO,8"
-LEGACY_HELLOS = (b"!HELLO,1", b"!HELLO,2", b"!HELLO,3", b"!HELLO,4", b"!HELLO,5", b"!HELLO,6", b"!HELLO,7")
-FAST_TELEMETRY_HELLOS = (b"!HELLO,6", b"!HELLO,7", PROTOCOL_HELLO)
+PROTOCOL_HELLO = b"!HELLO,12"
+LEGACY_HELLOS = tuple(f"!HELLO,{version}".encode("ascii") for version in range(1, 12))
+FAST_TELEMETRY_HELLOS = (*LEGACY_HELLOS[5:], PROTOCOL_HELLO)
 LOCAL_GRAVITY = 9.78627
 IMU_REFERENCE_PATH = Path(__file__).with_name("referencia_imu.txt")
 DEFAULT_IMU_REFERENCE = (0.0, 0.0, 1.0)
 ENCODER_RESOLUTION_DEG = .28125
 SETTINGS_PATH = Path(__file__).with_name("parametros_motores.txt")
+FRICTION_PATH = Path(__file__).with_name("parametros_zona_morta.txt")
 CONTROL_LAWS = ("P", "PI", "PID", "PIDF")
 PIDF = CONTROL_LAWS.index("PIDF")
 DEFAULTS = dict.fromkeys(MOTORS, (400, 20, 10, .105, 30, 90, 8, 4, 30, 1, PIDF))
 PROFILE_HEADER = "# PIDF externo em graus, saida em graus/s. PI interno gera PWM."
-MODES = ("Freio dinâmico", "Livre", "Calibração", "Posição", "Degrau", "Seno", "Cosseno", "Rampa")
+MODES = ("Freio dinâmico", "Livre", "Calibração", "Posição", "Degrau", "Seno", "Cosseno", "Rampa", "Teste de PWM")
 PHASES = ("busca rápida", "recuo", "busca lenta", "liberação da chave")
 FAULTS = (
     "", "conexão perdida", "dois fins de curso ativos", "fim de curso inesperado na calibração",
     "tempo de calibração excedido", "leitura do encoder atrasada", "encoder sem movimento",
     "curso menor que 16 contagens", "fim de curso fora da posição calibrada",
     "velocidade excessiva", "encoder fora do curso calibrado",
+    "fim de curso confirmado na autocorreção", "posição fora da faixa de autocorreção",
+    "tempo excedido para chegar a 40%", "alvo de autocorreção fora da faixa",
 )
+STALL_FAULT = 6
+OVERSPEED_FAULT = 9
 ERRORS = {
+    "teste_pwm_requer_curso": "Calibre o curso e deixe o motor a mais de 2° dos fins de curso.",
+    "teste_pwm_em_andamento": "Pare o teste de PWM antes de usar outro acionamento.",
     "libere_os_fins_de_curso": "Libere os fins de curso antes de calibrar.",
     "freio_necessario": "Acione o freio antes de repetir a operação.",
     "calibracao_ou_freio_necessario": "Calibre o curso e acione o freio se o motor estiver livre.",
@@ -58,12 +66,8 @@ ERRORS = {
     "home_requer_curso": "Calibre o curso dos dois motores para usar Home.",
     "home_requer_encoder": "Aguarde leituras dos dois encoders para usar Home.",
     "home_em_andamento": "A mesa está indo para Home. Use Parar para interromper.",
+    "bola_em_andamento": "A autocorreção da bola está ativa. Use Parar para interromper.",
 }
-
-HOME_MESSAGES = (
-    "", "Movendo para 40% do curso", "Freio Home ativo", "Movimento para Home interrompido",
-    "Tempo excedido ao buscar Home", "Home interrompido por falha no motor",
-)
 
 LEVEL_MESSAGES = (
     "Pronta para nivelar", "Medindo a inclinação inicial", "Medindo o efeito do M1",
@@ -120,10 +124,10 @@ def load_settings(path=SETTINGS_PATH):
             if motor not in MOTORS or motor in seen or settings_errors(values):
                 raise ValueError(f"parâmetros inválidos para o motor {motor}")
             if legacy:
-                values = (*DEFAULTS[motor][:4], *values[4:])
+                values = (*DEFAULTS[motor][:4], *values[4:10], PIDF)
             settings[motor] = values
             seen.add(motor)
-        warning = "Ganhos antigos substituídos pelos iniciais da malha em cascata." if legacy and seen else ""
+        warning = "Perfil antigo carregado com os ganhos da malha em cascata." if legacy and seen else ""
         return settings, warning
     except (OSError, ValueError) as error:
         return DEFAULTS.copy(), f"Falha ao ler {path.name} ({error}). Padrões carregados."
@@ -175,6 +179,8 @@ class SerialSession:
         self.framer = framer
         self.incoming = deque(maxlen=4096)
         self.outgoing = Queue()
+        self.ball_target = deque(maxlen=1)
+        self.ball_sent = deque(maxlen=256)
         self.stopping = Event()
         self.braking = Event()
         self.ui_at = monotonic()
@@ -185,10 +191,13 @@ class SerialSession:
     def send(self, command):
         if command == "STOP":
             self.braking.set()
+        elif command.startswith("BALL "):
+            self.ball_target.append((monotonic(), command))
         else:
             self.outgoing.put(command)
 
     def discard_commands(self):
+        self.ball_target.clear()
         while True:
             try:
                 self.outgoing.get_nowait()
@@ -226,6 +235,16 @@ class SerialSession:
                             except Empty:
                                 break
                             self.write(command)
+                        if not self.braking.is_set():
+                            try:
+                                target_at, target = self.ball_target.popleft()
+                            except IndexError:
+                                pass
+                            else:
+                                if now - target_at <= .12:
+                                    self.write(target)
+                                    _, m1, m3 = target.split()
+                                    self.ball_sent.append((monotonic(), float(m1), float(m3)))
                 else:
                     self.discard_commands()
                     if hello and not ui_stopped:
@@ -242,6 +261,8 @@ class SerialSession:
                         hello = False
                         next_hello = 0
                         self.discard_commands()
+                    elif line in (b"!BALL,0", b"!BALL,2", b"!BALL,3"):
+                        self.ball_target.clear()
                     self.incoming.append(line)
         except OSError as error:
             self.error = str(error)
@@ -403,6 +424,28 @@ class MotorPanel:
             ttk.Entry(wave, width=5, textvariable=var).pack(side="left")
         self.button(wave, "Iniciar", lambda: action(self.run_wave), side="right")
 
+    def add_pwm_test(self, toggle, use):
+        row = ttk.LabelFrame(self.frame, text="Zona morta · teste de PWM", padding=3)
+        row.pack(fill="x", pady=(3, 0))
+        self.pwm_direction = StringVar(value="Subir curso (+)")
+        self.pwm_direction_box = ttk.Combobox(row, textvariable=self.pwm_direction, width=15,
+            values=("Subir curso (+)", "Descer curso (−)"), state="readonly")
+        self.pwm_direction_box.pack(side="left")
+        self.pwm_target = DoubleVar()
+        self.pwm_label = StringVar(value="0,00%")
+        self.pwm_slider = ttk.Scale(row, from_=0, to=100, variable=self.pwm_target, state="disabled",
+            command=lambda value: self.pwm_label.set(f"{float(value):.2f}%"))
+        self.pwm_slider.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Label(row, textvariable=self.pwm_label, width=8).pack(side="left")
+        self.pwm_button = ttk.Button(row, text="Iniciar teste", command=lambda: toggle(self.motor))
+        self.pwm_button.pack(side="left", padx=3)
+        self.pwm_use = ttk.Button(row, text="Usar e salvar medição", command=lambda: use(self.motor))
+        self.pwm_use.pack(side="left")
+        self.pwm_message = StringVar()
+        ttk.Label(self.frame, textvariable=self.pwm_message).pack(anchor="w")
+        self.pwm_saved = StringVar()
+        ttk.Label(self.frame, textvariable=self.pwm_saved).pack(anchor="w")
+
     def button(self, parent, label, callback, **pack):
         button = ttk.Button(parent, text=label, command=callback, state="disabled")
         button.pack(**pack)
@@ -460,12 +503,17 @@ class MotorPanel:
             state += f" ({endpoint}, {PHASES[sample.phase]})"
         if sample.fault:
             state += f" · {FAULTS[sample.fault]}"
-        if sample.fault_threshold > 0:
+        if sample.fault == STALL_FAULT and sample.fault_threshold > 0:
+            if sample.calibrated != 3 and sample.endpoint in (1, 2):
+                endpoint = "mínimo" if sample.endpoint == 1 else "máximo"
+                state += f" · {PHASES[sample.phase]} do {endpoint}"
+            state += f" a {sample.fault_speed:+.1f}% PWM (teto {sample.fault_threshold:.1f}%)"
+        elif sample.fault == OVERSPEED_FAULT and sample.fault_threshold > 0:
             state += f" ({sample.fault_speed:.1f} > {sample.fault_threshold:.1f} °/s)"
         bounds = {0: "livres", 1: "mín.", 2: "máx.", 3: "ambos"}.get(sample.limits, "—")
         position = f"{sample.angle:.2f}° / {sample.span:.2f}°" if sample.calibrated == 3 else "curso pendente"
         enable = f"  |  EN na Pico: {sample.enable}" if sample.enable >= 0 else ""
-        speed_reference = f"  |  Ref. {sample.speed_setpoint:+.1f} °/s" if sample.mode >= 3 else ""
+        speed_reference = f"  |  Ref. de velocidade {sample.speed_setpoint:+.1f} °/s" if 3 <= sample.mode <= 7 else ""
         self.status.set(f"{state}  |  {position}  |  Fins {bounds}\n"
                         f"{sample.speed:+.1f} °/s{speed_reference}  |  PWM {sample.pwm:+.1f}%{enable}")
 
@@ -485,6 +533,17 @@ class MotorTab:
     def __init__(self, parent, send):
         self.send = send
         self.settings, warning = load_settings()
+        self.friction = dict.fromkeys(MOTORS, (0., 0.))
+        try:
+            data = json.loads(FRICTION_PATH.read_text(encoding="utf-8"))
+            self.friction = {motor: tuple(map(float, data[str(motor)])) for motor in MOTORS}
+            if any(len(pair) != 2 or any(not 0 <= value <= 100 for value in pair) for pair in self.friction.values()):
+                raise ValueError("limiar inválido")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.friction = dict.fromkeys(MOTORS, (0., 0.))
+            warning = f"Falha ao carregar zona morta ({error})."
         self.configured = set()
         self.pending = {}
         self.applied = {}
@@ -496,15 +555,13 @@ class MotorTab:
         self.imu_reference, self.imu_file_warning = load_imu_reference()
         self.imu_message = StringVar()
         self.imu_buttons = []
-        self.home_buttons = []
-        self.home_message = StringVar()
         self.message = StringVar(value=warning or "Aguardando sessão de acionamento")
         self.warning = warning
         self.toolbar = ttk.Frame(parent)
         self.toolbar.pack(fill="x")
         self.buttons = []
         for text, command in (("Parar motores (Esc)", "STOP"), ("Soltar motores", "COAST"),
-                              ("Calibrar M1 → M3", "CAL")):
+                              ("Calibrar M1 → M3", "CAL"), ("Calibrar só M3", "CAL 3")):
             button = ttk.Button(self.toolbar, text=text, command=lambda cmd=command: self.action(lambda: cmd),
                                 state="disabled")
             button.pack(side="left", padx=(0, 5))
@@ -523,15 +580,13 @@ class MotorTab:
                             command=lambda: self.action(self.run_circle))
         button.pack(side="left", padx=4)
         self.buttons.append(button)
-        home_controls = ttk.Frame(parent)
-        home_controls.pack(fill="x", pady=(4, 0))
-        self.add_home_control(home_controls)
         ttk.Label(parent, textvariable=self.message).pack(anchor="w", pady=4)
         layout = ttk.Frame(parent)
         layout.pack(fill="x")
         self.panels = {}
         for column, motor in enumerate(MOTORS):
             panel = MotorPanel(layout, motor, self.action, self.save_motor)
+            panel.add_pwm_test(self.toggle_pwm, self.use_pwm_result)
             layout.columnconfigure(column, weight=1, uniform="controle")
             panel.frame.grid(row=0, column=column, sticky="nsew", padx=3)
             panel.set_values(self.settings[motor])
@@ -555,6 +610,7 @@ class MotorTab:
         self.axes = dict(zip(MOTORS, figure.subplots(1, 2)))
         self.traces = {}
         self.pwm_traces = {}
+        self.speed_axes = {}
         self.showing_pwm = False
         for motor, axis in self.axes.items():
             axis.set(title=f"Motor {motor}", ylabel="Posição (°)", xlabel="Tempo (s)")
@@ -563,6 +619,12 @@ class MotorTab:
                 ("--", "Alvo"), (":", "Referência"), ("-", "Encoder"),
             )]
             self.pwm_traces[motor], = axis.plot([], [], color="tab:purple", label="PWM aplicado", visible=False)
+            speed_axis = axis.twinx()
+            speed_axis.set_ylabel("Velocidade (°/s)")
+            speed_axis.set_visible(False)
+            speed_axis.plot([], [], color="tab:green", label="Velocidade medida")
+            speed_axis.plot([], [], ":", color="tab:orange", label="Ref. de velocidade")
+            self.speed_axes[motor] = speed_axis
             axis.legend(handles=self.traces[motor], fontsize=8)
         self.canvas = FigureCanvasTkAgg(figure, master=parent)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -581,17 +643,25 @@ class MotorTab:
         for button in self.imu_buttons:
             available = self.ready and self.imu_ready and not self.level_running and self.imu_pending is None
             button.configure(state="normal" if available else "disabled")
-        for button in self.home_buttons:
-            available = self.ready and self.home_state is not None and self.home_state != 1 and not self.level_running
-            button.configure(state="normal" if available else "disabled")
         for panel in self.panels.values():
             for button in panel.buttons:
                 button.configure(state="normal" if self.ready else "disabled")
+            selected = self.pwm_motor == panel.motor
+            panel.pwm_button.configure(text="Parar teste" if selected else "Iniciar teste",
+                state="normal" if self.ready and (selected or self.pwm_motor is None) else "disabled")
+            panel.pwm_slider.configure(state="normal" if selected and self.pwm_ack else "disabled")
+            panel.pwm_direction_box.configure(state="disabled" if selected else "readonly")
+            panel.pwm_use.configure(state="normal" if self.ready and self.pwm_motor is None
+                                    and panel.motor in self.pwm_results else "disabled")
 
     def reset(self):
         self.ready = self.connected = False
         self.compatible = False
         self.fast_telemetry = False
+        self.pwm_motor = None
+        self.pwm_ack = False
+        self.pwm_results = {}
+        self.pwm_next = 0
         self.retry_at = 0
         self.configured.clear()
         self.pending.clear()
@@ -603,8 +673,6 @@ class MotorTab:
         self.imu_pending = None
         self.imu_retry_at = 0
         self.imu_message.set(self.imu_file_warning)
-        self.home_state = None
-        self.home_message.set("")
         self.set_motion_limits(None)
         self.samples = {motor: deque(maxlen=2000) for motor in MOTORS}
         self.steps = {motor: [] for motor in MOTORS}
@@ -616,6 +684,8 @@ class MotorTab:
             panel.gain_status.set("")
             panel.active_limits.set("Aguardando limites confirmados pelo Pico")
             self.metrics[motor].set(f"M{motor} · Aguardando degrau")
+            panel.pwm_message.set("")
+            self.show_friction(motor)
         self.set_buttons()
 
     def set_scale(self, resolution):
@@ -641,14 +711,6 @@ class MotorTab:
             self.imu_buttons.append(button)
         ttk.Label(imu_row, textvariable=self.imu_message).pack(side="left")
         self.set_buttons()
-
-    def add_home_control(self, parent):
-        button = ttk.Button(parent, text="Travar em Home (40%)", command=lambda: self.action(lambda: "HOME"),
-                            state="disabled")
-        button.pack(side="left", padx=(0, 6))
-        ttk.Label(parent, textvariable=self.home_message).pack(side="left")
-        self.home_buttons.append(button)
-        return button
 
     def imu_action(self, command):
         if not (self.ready and self.imu_ready and self.imu_pending is None and not self.level_running):
@@ -703,18 +765,14 @@ class MotorTab:
                 self.message.set(f"Motor {motor} · Aguarde a confirmação do Pico.")
                 return
             self.pending[motor] = tuple(map(float, command.split()[2:]))
-        elif command in ("CAL", "CIRCLE", "LEVEL", "HOME") or command.startswith(("GO ", "STEP ", "WAVE ")):
-            motors = MOTORS if command in ("CAL", "CIRCLE", "LEVEL", "HOME") else (int(command.split()[1]),)
-            if not self.check_applied(motors, calibration=command == "CAL"):
+        elif command in ("CAL", "CIRCLE", "LEVEL") or command.startswith(("CAL ", "GO ", "STEP ", "WAVE ")):
+            motors = MOTORS if command in ("CAL", "CIRCLE", "LEVEL") else (int(command.split()[1]),)
+            if not self.check_applied(motors, calibration=command.split()[0] == "CAL"):
                 if command == "LEVEL":
                     self.level_message.set(self.message.get())
-                if command == "HOME":
-                    self.home_message.set(self.message.get())
                 return
             if command == "LEVEL":
                 self.level_message.set("Aguardando confirmação do Pico")
-            if command == "HOME":
-                self.home_message.set("Solicitando Home")
         if command.startswith("STEP "):
             self.plot_mode.set("Degrau +1°")
         elif command.startswith(("GO ", "WAVE ", "CIRCLE ")):
@@ -740,12 +798,95 @@ class MotorTab:
                 return False
         return True
 
+    def show_friction(self, motor):
+        forward, reverse = self.friction[motor]
+        values = (f"{value:.2f}%" if value else "a medir" for value in (forward, reverse))
+        plus, minus = values
+        self.panels[motor].pwm_saved.set(f"Compensação medida · Subir {plus} · Descer {minus}")
+
+    def send_friction(self, motor):
+        forward, reverse = self.friction[motor]
+        self.send(f"FRICTION {motor} {forward:.2f} {reverse:.2f}")
+
+    def toggle_pwm(self, motor):
+        if self.pwm_motor is not None:
+            self.finish_pwm("Teste parado", brake=True)
+            return
+        if not self.ready or not self.check_applied((motor,), calibration=True):
+            return
+        panel = self.panels[motor]
+        panel.pwm_slider.configure(to=self.applied[motor][8])
+        panel.pwm_target.set(0)
+        panel.pwm_label.set("0,00%")
+        self.pwm_motor, self.pwm_ack = motor, False
+        self.pwm_next = monotonic() + .35
+        self.pwm_results.pop(motor, None)
+        self.plot_mode.set("PWM ao vivo")
+        panel.pwm_message.set("Aguardando confirmação do Pico")
+        direction = 1 if panel.pwm_direction.get().endswith("(+)") else -1
+        self.send(f"PWMSTART {motor} {direction}")
+        self.set_buttons()
+
+    def finish_pwm(self, message, brake=False):
+        if self.pwm_motor is None:
+            return
+        self.panels[self.pwm_motor].pwm_message.set(message)
+        self.pwm_motor, self.pwm_ack = None, False
+        if brake:
+            self.send("STOP")
+        self.set_buttons()
+
+    def tick_pwm(self, now, visible):
+        if self.pwm_motor is None:
+            return
+        if not visible:
+            self.finish_pwm("Teste parado ao sair da aba", brake=True)
+        elif now >= self.pwm_next:
+            if not self.pwm_ack:
+                self.finish_pwm("O Pico não confirmou o teste", brake=True)
+                return
+            motor = self.pwm_motor
+            self.send(f"PWMVAL {motor} {self.panels[motor].pwm_target.get():.2f}")
+            self.pwm_next = now + .08
+
+    def receive_pwm(self, fields):
+        try:
+            motor, state, direction = map(int, fields[:3])
+            duty = float(fields[3])
+        except ValueError:
+            return
+        if motor != self.pwm_motor or not self.pwm_ack:
+            return
+        if state == 2 and direction in (-1, 1) and 0 < duty <= 100:
+            self.pwm_results[motor] = (direction, duty)
+            self.finish_pwm(f"Saiu do repouso a {duty:.2f}% PWM · {'subida' if direction > 0 else 'descida'}")
+        elif state == 3:
+            self.finish_pwm("Teste interrompido pelo Pico · confira o estado do motor")
+
+    def use_pwm_result(self, motor):
+        if not self.ready or self.pwm_motor is not None or motor not in self.pwm_results:
+            return
+        direction, duty = self.pwm_results[motor]
+        forward, reverse = self.friction[motor]
+        values = {**self.friction, motor: (duty, reverse) if direction > 0 else (forward, duty)}
+        temporary = FRICTION_PATH.with_suffix(".tmp")
+        try:
+            temporary.write_text(json.dumps(values, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(FRICTION_PATH)
+        except OSError as error:
+            self.panels[motor].pwm_message.set(f"Falha ao salvar ({error})")
+            return
+        self.friction = values
+        self.send_friction(motor)
+        self.show_friction(motor)
+        self.panels[motor].pwm_message.set(f"Limiar de {duty:.2f}% salvo e enviado ao Pico")
+
     def receive(self, line):
         if line.startswith(b"@,"):
             sample = MotorSample.parse(line.split(b",")[1:])
             if sample is not None:
                 self.record(sample)
-            return
+            return sample
         fields = line.decode("ascii", errors="replace").split(",")
         if line in LEGACY_HELLOS:
             self.connected = True
@@ -755,6 +896,7 @@ class MotorTab:
             self.level_message.set("Grave o firmware atualizado para nivelar")
             self.set_buttons()
         elif line == PROTOCOL_HELLO:
+            self.finish_pwm("Teste interrompido pela reconexão")
             self.connected = True
             self.compatible = True
             self.fast_telemetry = True
@@ -763,14 +905,14 @@ class MotorTab:
             self.configured.clear()
             self.pending.clear()
             self.applied.clear()
-            self.home_state = None
-            self.home_message.set("")
             self.imu_ready = False
             self.imu_pending = None
             self.imu_retry_at = monotonic() + 2
             self.set_motion_limits(None)
             self.message.set("Sincronizando parâmetros com o Pico")
             self.set_buttons()
+            for motor in MOTORS:
+                self.send_friction(motor)
         elif fields[0] == "!SCALE" and len(fields) == 2:
             try:
                 resolution = number(fields[1])
@@ -783,15 +925,8 @@ class MotorTab:
             self.set_buttons()
         elif fields[0] == "!LEVEL" and len(fields) == 5 and self.compatible:
             self.receive_level(fields[1:])
-        elif fields[0] == "!HOME" and len(fields) == 2 and self.compatible:
-            try:
-                state = int(fields[1])
-            except ValueError:
-                return
-            if state in range(len(HOME_MESSAGES)) and state != self.home_state:
-                self.home_state = state
-                self.home_message.set(HOME_MESSAGES[state])
-                self.set_buttons()
+        elif fields[0] == "!PWMTEST" and len(fields) == 5 and self.compatible:
+            self.receive_pwm(fields[1:])
         elif fields[0] == "!IMUCFG" and len(fields) == 4 and self.compatible:
             self.receive_imu_reference(fields[1:])
         elif fields[0] == "!CFG" and len(fields) == 13 and self.compatible:
@@ -815,18 +950,24 @@ class MotorTab:
             self.message.set(f"{command} · {ERRORS.get(reason, reason.replace('_', ' '))}")
             if command == "LEVEL":
                 self.level_message.set(ERRORS.get(reason, reason.replace("_", " ")))
-            if command == "HOME":
-                self.home_message.set(ERRORS.get(reason, reason.replace("_", " ")))
+            if command in ("PWMSTART", "PWMVAL"):
+                self.finish_pwm(ERRORS.get(reason, reason.replace("_", " ")), brake=self.pwm_ack)
             if command in ("IMUZERO", "IMUYAW", "IMUCFG"):
                 self.imu_pending = None
                 self.imu_message.set(ERRORS.get(reason, reason.replace("_", " ")))
                 self.set_buttons()
         elif fields[0] == "!OK" and len(fields) == 2:
+            if fields[1] == "PWMSTART" and self.pwm_motor is not None:
+                self.pwm_ack = True
+                self.pwm_next = 0
+                self.panels[self.pwm_motor].pwm_message.set("Suba em pequenos passos e aguarde o PWM aplicado")
+                self.set_buttons()
             if fields[1] == "IMUYAW":
                 self.imu_pending = None
                 self.imu_message.set("Z relativo zerado")
                 self.set_buttons()
             if fields[1] == "STOP":
+                self.finish_pwm("Teste parado")
                 self.pending.clear()
                 if self.imu_pending is not None:
                     self.imu_pending = None
@@ -951,6 +1092,7 @@ class MotorTab:
         show_pwm = plot_mode == "PWM ao vivo"
         show_travel = self.plot_units.get() == "Curso (%)"
         for motor, axis in self.axes.items():
+            speed_axis = self.speed_axes[motor]
             stream = self.samples[motor]
             if stream:
                 self.panels[motor].update(stream[-1])
@@ -966,10 +1108,17 @@ class MotorTab:
                 for trace in self.traces[motor]:
                     trace.set_visible(not show_pwm)
                 self.pwm_traces[motor].set_visible(show_pwm)
-                axis.legend(handles=[self.pwm_traces[motor]] if show_pwm else self.traces[motor], fontsize=8)
+                speed_axis.set_visible(show_pwm)
+                handles = [self.pwm_traces[motor], *speed_axis.lines] if show_pwm else self.traces[motor]
+                axis.legend(handles=handles, fontsize=8)
             axis.set_ylabel("PWM (%)" if show_pwm else "Curso (%)" if show_travel else "Posição (°)")
             if show_pwm:
                 self.pwm_traces[motor].set_data(times, [row.pwm for row in rows])
+                measured, reference = speed_axis.lines
+                measured.set_data(times, [abs(row.speed) if row.mode == 2 else row.speed for row in rows])
+                reference.set_data(times, [row.speed_setpoint for row in rows])
+                speed_axis.relim()
+                speed_axis.autoscale_view(scalex=False)
             else:
                 for trace, field in zip(self.traces[motor], ("goal", "reference", "angle")):
                     data = [getattr(row, field) for row in rows]
