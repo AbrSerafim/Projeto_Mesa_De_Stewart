@@ -71,8 +71,8 @@ while True:
     # Position to table angle
     # -------------------------------
 
-    x_to_theta.update(pos=xc, k=k)
-    y_to_psi.update(pos=yc,k=k)
+    x_to_theta.update(pos=-xc, k=k)
+    y_to_psi.update(pos=-yc,k=k)
 
     # -------------------------------
     # Table angle to motor angle
