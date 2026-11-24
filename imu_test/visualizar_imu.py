@@ -13,11 +13,12 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import serial
 from serial.tools import list_ports
-from controle_motores import MotorTab, SerialSession
+from controle_motores import LOCAL_GRAVITY, PROTOCOL_HELLO, MotorTab, SerialSession
 
 
 HISTORY_SECONDS = 10
-LOG_PERIOD = 0.04
+LOG_PERIOD = 0.02
+LEGACY_LOG_PERIOD = 0.04
 MAX_LINE_BYTES = 512
 COLORS = ("tab:red", "tab:green", "tab:blue")
 BOARD = np.array([[-1, -0.65, 0], [1, -0.65, 0], [1, 0.65, 0], [-1, 0.65, 0]])
@@ -265,6 +266,8 @@ def visualize():
     motor_plots = MotorPlots(motors_tab)
     motor_history = deque()
 
+    imu_actions = ttk.Frame(imu_tab, padding=(8, 6))
+    imu_actions.pack(side="top", fill="x")
     figure = Figure(figsize=(12, 6), layout="constrained")
     canvas = FigureCanvasTkAgg(figure, master=imu_tab)
     toolbar = NavigationToolbar2Tk(canvas, imu_tab, pack_toolbar=False)
@@ -274,7 +277,8 @@ def visualize():
     accel = figure.add_subplot(grid[0, 0])
     gyro = figure.add_subplot(grid[1, 0], sharex=accel)
     gyro.set_xlabel("Tempo relativo ao presente (s)")
-    traces = add_traces(accel, "Acelerômetro", "g")
+    traces = add_traces(accel, "Acelerômetro", "m/s²")
+    accel.axhline(LOCAL_GRAVITY, color="0.45", linestyle=":", linewidth=1)
     traces += add_traces(gyro, "Giroscópio", "°/s")
 
     orientation = figure.add_subplot(grid[:, 1], projection="3d")
@@ -294,16 +298,18 @@ def visualize():
     history = deque(maxlen=2000)
     session = None
     drive = MotorTab(drive_tab, lambda command: session.send(command) if session else None)
+    drive.add_level_controls(imu_actions)
     window.bind("<Escape>", lambda _event: session.send("STOP") if session else None)
     last_sample_at = None
     last_packet_at = None
     latest_imu = None
+    acceleration_si = False
     message = "Aguardando dados"
     next_draw = 0.0
     timer = canvas.new_timer(interval=15)
 
     def reset_stream():
-        nonlocal last_sample_at, last_packet_at, latest_imu, message, next_draw
+        nonlocal last_sample_at, last_packet_at, latest_imu, message, next_draw, acceleration_si
         history.clear()
         motor_history.clear()
         drive.reset()
@@ -311,6 +317,7 @@ def visualize():
         last_sample_at = None
         last_packet_at = None
         latest_imu = None
+        acceleration_si = False
         message = "Aguardando dados"
         for panel in motor_panels:
             panel.update(None, (None, None))
@@ -367,7 +374,7 @@ def visualize():
     port_button.configure(command=show_ports)
 
     def refresh():
-        nonlocal session, last_sample_at, last_packet_at, latest_imu, message, next_draw
+        nonlocal session, last_sample_at, last_packet_at, latest_imu, message, next_draw, acceleration_si
         if session is None:
             return
         now = monotonic()
@@ -386,6 +393,8 @@ def visualize():
         latest = None
         for _ in range(min(len(session.incoming), 512)):
             line = session.incoming.popleft()
+            if line in (PROTOCOL_HELLO, b"!HELLO,7") or line.startswith(b"accelx_mps2,"):
+                acceleration_si = True
             if line.startswith((b"@", b"!")):
                 drive.receive(line)
             elif line.startswith(b"#"):
@@ -407,12 +416,16 @@ def visualize():
                     latest_imu = None
                     samples.clear()
                 else:
-                    samples.append(packet.imu)
+                    sample = packet.imu
+                    if not acceleration_si:
+                        sample = tuple(value * 9.80665 for value in sample[:3]) + sample[3:]
+                    samples.append(sample)
         drive.check_sync(now)
 
         if motor_samples:
             previous = motor_history[-1][0] if motor_history else None
-            times = batch_times(len(motor_samples), now, LOG_PERIOD, previous)
+            period = LOG_PERIOD if drive.fast_telemetry else LEGACY_LOG_PERIOD
+            times = batch_times(len(motor_samples), now, period, previous)
             motor_history.extend(zip(times, motor_samples))
         while motor_history and motor_history[0][0] < now - HISTORY_SECONDS:
             motor_history.popleft()
@@ -433,7 +446,9 @@ def visualize():
                 panel.update(None, (None, None))
 
         if samples:
-            period = 0.01 if latest.motors is None else LOG_PERIOD
+            period = LOG_PERIOD if drive.fast_telemetry else LEGACY_LOG_PERIOD
+            if latest.motors is None:
+                period = 0.01
             times = batch_times(len(samples), now, period, last_sample_at)
             history.extend((timestamp, *sample) for timestamp, sample in zip(times, samples))
             last_sample_at = now

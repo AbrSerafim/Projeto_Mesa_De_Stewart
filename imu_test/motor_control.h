@@ -12,6 +12,7 @@ enum { LIMIT_MIN = 1u, LIMIT_MAX = 2u, LIMIT_BOTH = LIMIT_MIN | LIMIT_MAX };
 // The PIO decoder counts A and B transitions (x4).
 #define ENCODER_COUNTS_PER_OUTPUT_REV 1280.0f
 #define ENCODER_DEGREES_PER_COUNT (360.0f / ENCODER_COUNTS_PER_OUTPUT_REV)
+#define LOCAL_GRAVITY_MPS2 9.78627f
 
 typedef struct {
     int64_t min_count, max_count;
@@ -21,6 +22,11 @@ typedef struct {
 void motors_init(void);
 void motor_task(void *parameter);
 void motor_encoder_sample(unsigned motor, int64_t count, uint64_t sampled_at);
+void motor_imu_sample(float ax, float ay, float az, float gyro_norm, uint64_t sampled_at);
+bool imu_capture_reference(uint64_t now);
+bool imu_set_reference(float x, float y, float z);
+void imu_zero_heading(void);
+void imu_send_reference(void);
 unsigned motor_limits(void);
 TravelCalibration motor_travel(unsigned motor);
 void motor_command(char *line);

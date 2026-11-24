@@ -14,11 +14,17 @@ from matplotlib.figure import Figure
 
 
 MOTORS = (1, 3)
-PROTOCOL_HELLO = b"!HELLO,5"
-LEGACY_HELLOS = (b"!HELLO,1", b"!HELLO,2", b"!HELLO,3", b"!HELLO,4")
+PROTOCOL_HELLO = b"!HELLO,8"
+LEGACY_HELLOS = (b"!HELLO,1", b"!HELLO,2", b"!HELLO,3", b"!HELLO,4", b"!HELLO,5", b"!HELLO,6", b"!HELLO,7")
+FAST_TELEMETRY_HELLOS = (b"!HELLO,6", b"!HELLO,7", PROTOCOL_HELLO)
+LOCAL_GRAVITY = 9.78627
+IMU_REFERENCE_PATH = Path(__file__).with_name("referencia_imu.txt")
+DEFAULT_IMU_REFERENCE = (0.0, 0.0, 1.0)
 ENCODER_RESOLUTION_DEG = .28125
 SETTINGS_PATH = Path(__file__).with_name("parametros_motores.txt")
-DEFAULTS = dict.fromkeys(MOTORS, (4, 0, 0, .05, 30, 90, 8, 4, 30, 1))
+CONTROL_LAWS = ("P", "PI", "PID", "PIDF")
+PIDF = CONTROL_LAWS.index("PIDF")
+DEFAULTS = dict.fromkeys(MOTORS, (400, 20, 10, .105, 30, 90, 8, 4, 30, 1, PIDF))
 PROFILE_HEADER = "# PIDF externo em graus, saida em graus/s. PI interno gera PWM."
 MODES = ("Freio dinâmico", "Livre", "Calibração", "Posição", "Degrau", "Seno", "Cosseno", "Rampa")
 PHASES = ("busca rápida", "recuo", "busca lenta", "liberação da chave")
@@ -41,7 +47,24 @@ ERRORS = {
     "sem_sessao": "A sessão serial foi interrompida.",
     "ganhos_ou_pwm_zerados": "Aplique pelo menos um ganho e um limite de PWM maior que zero.",
     "pwm_zerado": "Aplique um limite de PWM maior que zero nos dois motores para calibrar.",
+    "nivelamento_em_andamento": "O nivelamento está em andamento. Use Parar para interromper.",
+    "nivelamento_requer_limites": "Reative os limites V/A na aba Acionamento para nivelar.",
+    "nivelamento_requer_curso": "Calibre o curso dos dois motores na aba Acionamento.",
+    "nivelamento_fora_do_curso": "Reposicione os motores dentro do curso calibrado.",
+    "imu_indisponivel": "Aguarde a IMU concluir a calibração inicial.",
+    "imu_requer_mesa_parada": "Aguarde pelo menos 2 s com a mesa parada e tente novamente.",
+    "referencia_imu_invalida": "Referência inválida. Confira a orientação da IMU.",
+    "eixo_z_invertido": "O Z da mesa está medindo para baixo. Confira a montagem da IMU.",
 }
+
+LEVEL_MESSAGES = (
+    "Pronta para nivelar", "Medindo a inclinação inicial", "Medindo o efeito do M1",
+    "Medindo o efeito do M3", "Corrigindo a inclinação", "Mesa nivelada", "Nivelamento interrompido",
+    "A leitura da IMU foi interrompida", "Tempo excedido ao aguardar posição estável",
+    "Inclinação inicial alta ou os motores não corrigem dois eixos independentes",
+    "Limite de curso ou margem de movimento atingidos", "A inclinação deixou de melhorar",
+    "Um motor parou por falha. Confira a aba Acionamento.",
+)
 
 FIELDS = (
     ("Kp", 0, 1000), ("Ki", 0, 5000), ("Kd", -100, 100), ("Tf (s)", 0, 2),
@@ -51,12 +74,14 @@ FIELDS = (
 
 
 def settings_errors(values):
-    if len(values) != 10 or not all(map(isfinite, values)):
+    if len(values) != 11 or not all(map(isfinite, values)):
         return ["Preencha todos os parâmetros com valores finitos."]
     errors = [f"{name} deve ficar entre {low:g} e {high:g} (informado {value:g})."
               for (name, low, high), value in zip(FIELDS, values) if not low <= value <= high]
-    _, _, kd, tf, speed, _, fast, slow, _, polarity = values
-    if kd != 0 and tf < .0001:
+    _, _, kd, tf, speed, _, fast, slow, _, polarity, law = values
+    if law not in range(len(CONTROL_LAWS)):
+        errors.append("Selecione P, PI, PID ou PIDF.")
+    if law == PIDF and kd != 0 and tf < .0001:
         errors.append("Tf deve ser de pelo menos 0,0001 s quando Kd estiver ativo.")
     if fast > speed:
         errors.append(f"Cal. rápida ({fast:g} °/s) excede V máx. ({speed:g} °/s).")
@@ -82,6 +107,8 @@ def load_settings(path=SETTINGS_PATH):
             motor, *raw = line.split()
             motor = int(motor)
             values = tuple(map(float, raw))
+            if len(values) == 10:
+                values = (*values, PIDF)
             if motor not in MOTORS or motor in seen or settings_errors(values):
                 raise ValueError(f"parâmetros inválidos para o motor {motor}")
             if legacy:
@@ -96,7 +123,7 @@ def load_settings(path=SETTINGS_PATH):
 
 def save_settings(settings, path=SETTINGS_PATH):
     content = (PROFILE_HEADER + "\n"
-               "# Motor Kp Ki Kd Tf Vmax Amax Vcal_rapida Vcal_lenta PWMmax Polaridade\n")
+               "# Motor Kp Ki Kd Tf Vmax Amax Vcal_rapida Vcal_lenta PWMmax Polaridade Modo(0=P,1=PI,2=PID,3=PIDF)\n")
     content += "".join(f"{motor} " + " ".join(f"{x:.7g}" for x in settings[motor]) + "\n"
                        for motor in MOTORS)
     temporary = path.with_suffix(".tmp")
@@ -106,6 +133,29 @@ def save_settings(settings, path=SETTINGS_PATH):
 
 def same_settings(first, second):
     return all(isclose(a, b, rel_tol=1e-6, abs_tol=1e-8) for a, b in zip(first, second))
+
+
+def parse_imu_reference(parts):
+    values = tuple(map(float, parts))
+    if len(values) != 3 or not all(map(isfinite, values)):
+        raise ValueError("Vetor de referência inválido")
+    norm_squared = sum(value * value for value in values)
+    if not .99**2 <= norm_squared <= 1.01**2 or values[2] < .8 * norm_squared**.5:
+        raise ValueError("Direção de referência inválida")
+    return tuple(value / norm_squared**.5 for value in values)
+
+
+def load_imu_reference():
+    try:
+        return parse_imu_reference(IMU_REFERENCE_PATH.read_text(encoding="utf-8").split()), ""
+    except FileNotFoundError:
+        return DEFAULT_IMU_REFERENCE, ""
+    except (OSError, ValueError) as error:
+        return DEFAULT_IMU_REFERENCE, f"Falha ao ler a referência da IMU ({error})."
+
+
+def imu_reference_command(values):
+    return "IMUCFG " + " ".join(f"{value:.8g}" for value in values)
 
 
 class SerialSession:
@@ -293,6 +343,10 @@ class MotorPanel:
             ttk.Entry(gains, textvariable=variable, width=8).grid(row=1, column=index, sticky="ew", padx=(0, 4))
         self.gain_status = StringVar()
         ttk.Label(gains, textvariable=self.gain_status).grid(row=2, columnspan=4, sticky="w")
+        self.control_law = StringVar(value="PIDF")
+        ttk.Label(gains, text="Modo").grid(row=3, column=0, sticky="w")
+        ttk.Combobox(gains, textvariable=self.control_law, values=CONTROL_LAWS, state="readonly",
+                     width=6).grid(row=3, column=1, sticky="w")
         sliders = ttk.Frame(self.frame)
         sliders.pack(fill="x")
         sliders.columnconfigure(1, weight=1)
@@ -352,6 +406,7 @@ class MotorPanel:
         for (var, _), value in zip(self.sliders, values[4:9]):
             var.set(value)
         self.invert.set(values[9] == -1)
+        self.control_law.set(CONTROL_LAWS[int(values[10])])
 
     def zero_gains(self):
         for variable in self.gains:
@@ -359,7 +414,8 @@ class MotorPanel:
 
     def describe_applied_gain(self, values, resolution):
         proportional = values[0] * resolution
-        self.gain_status.set(f"P por contagem {proportional:.2f} °/s · teto de velocidade {values[4]:g} °/s")
+        law = CONTROL_LAWS[int(values[10])]
+        self.gain_status.set(f"No Pico · {law} · P por contagem {proportional:.2f} °/s")
         speed, accel, fast, slow, duty = values[4:9]
         self.active_limits.set(f"No Pico · V máx. {speed:g} °/s · A máx. {accel:g} °/s²"
                                f" · Cal. {fast:g}/{slow:g} °/s · PWM {duty:g}%")
@@ -372,7 +428,7 @@ class MotorPanel:
                 values.append(number(entry.get()))
             except ValueError as error:
                 raise ValueError(f"{name} requer um número finito.") from error
-        values = (*values, -1 if self.invert.get() else 1)
+        values = (*values, -1 if self.invert.get() else 1, CONTROL_LAWS.index(self.control_law.get()))
         errors = settings_errors(values)
         if errors:
             raise ValueError(" ".join(errors))
@@ -426,6 +482,12 @@ class MotorTab:
         self.applied = {}
         self.connected = False
         self.ready = False
+        self.level_button = None
+        self.level_stop_button = None
+        self.level_message = StringVar()
+        self.imu_reference, self.imu_file_warning = load_imu_reference()
+        self.imu_message = StringVar()
+        self.imu_buttons = []
         self.message = StringVar(value=warning or "Aguardando sessão de acionamento")
         self.warning = warning
         self.toolbar = ttk.Frame(parent)
@@ -437,6 +499,12 @@ class MotorTab:
                                 state="disabled")
             button.pack(side="left", padx=(0, 5))
             self.buttons.append(button)
+        self.limit_text = StringVar(value="Desativar limites V/A")
+        self.limit_button = ttk.Button(self.toolbar, textvariable=self.limit_text,
+                                       command=self.toggle_motion_limits, state="disabled")
+        self.limit_button.pack(side="left", padx=(0, 5))
+        self.limit_status = StringVar()
+        ttk.Label(self.toolbar, textvariable=self.limit_status).pack(side="left", padx=(0, 5))
         self.circle = [StringVar(value="1"), StringVar(value="5")]
         for label, var in zip(("Amplitude °", "Período s"), self.circle):
             ttk.Label(self.toolbar, text=label).pack(side="left", padx=(4, 2))
@@ -461,6 +529,9 @@ class MotorTab:
         self.plot_mode = StringVar(value="Degrau +1°")
         ttk.Combobox(plot_bar, textvariable=self.plot_mode, state="readonly", width=16,
                      values=("Degrau +1°", "Movimento ao vivo", "PWM ao vivo")).pack(side="left")
+        self.plot_units = StringVar(value="Ângulo (°)")
+        ttk.Combobox(plot_bar, textvariable=self.plot_units, state="readonly", width=12,
+                     values=("Ângulo (°)", "Curso (%)")).pack(side="left", padx=(6, 0))
         self.scale_label = StringVar()
         ttk.Label(plot_bar, textvariable=self.scale_label).pack(side="left", padx=8)
         self.metrics = {motor: StringVar() for motor in MOTORS}
@@ -476,7 +547,7 @@ class MotorTab:
             axis.set(title=f"Motor {motor}", ylabel="Posição (°)", xlabel="Tempo (s)")
             axis.grid(alpha=.25)
             self.traces[motor] = [axis.plot([], [], style, label=label)[0] for style, label in (
-                ("--", "Alvo"), (":", "Referência limitada"), ("-", "Encoder"),
+                ("--", "Alvo"), (":", "Referência"), ("-", "Encoder"),
             )]
             self.pwm_traces[motor], = axis.plot([], [], color="tab:purple", label="PWM aplicado", visible=False)
             axis.legend(handles=self.traces[motor], fontsize=8)
@@ -488,6 +559,15 @@ class MotorTab:
         for index, button in enumerate(self.buttons):
             enabled = self.connected if index == 0 else self.ready
             button.configure(state="normal" if enabled else "disabled")
+        self.limit_button.configure(state="normal" if self.ready and self.limits_enabled is not None else "disabled")
+        if self.level_button is not None:
+            self.level_button.configure(
+                state="normal" if self.ready and self.imu_ready and self.imu_pending is None
+                and not self.level_running else "disabled")
+            self.level_stop_button.configure(state="normal" if self.connected else "disabled")
+        for button in self.imu_buttons:
+            available = self.ready and self.imu_ready and not self.level_running and self.imu_pending is None
+            button.configure(state="normal" if available else "disabled")
         for panel in self.panels.values():
             for button in panel.buttons:
                 button.configure(state="normal" if self.ready else "disabled")
@@ -495,11 +575,20 @@ class MotorTab:
     def reset(self):
         self.ready = self.connected = False
         self.compatible = False
+        self.fast_telemetry = False
         self.retry_at = 0
         self.configured.clear()
         self.pending.clear()
         self.applied.clear()
-        self.samples = {motor: deque(maxlen=500) for motor in MOTORS}
+        self.level_report = None
+        self.level_running = False
+        self.level_message.set("Aguardando o Pico")
+        self.imu_ready = False
+        self.imu_pending = None
+        self.imu_retry_at = 0
+        self.imu_message.set(self.imu_file_warning)
+        self.set_motion_limits(None)
+        self.samples = {motor: deque(maxlen=2000) for motor in MOTORS}
         self.steps = {motor: [] for motor in MOTORS}
         self.step_result = {motor: "" for motor in MOTORS}
         self.set_scale(ENCODER_RESOLUTION_DEG)
@@ -517,6 +606,42 @@ class MotorTab:
         for motor, values in self.applied.items():
             self.panels[motor].describe_applied_gain(values, resolution)
 
+    def add_level_controls(self, parent):
+        level_row = ttk.Frame(parent)
+        level_row.pack(fill="x")
+        imu_row = ttk.Frame(parent)
+        imu_row.pack(fill="x", pady=(4, 0))
+        self.level_button = ttk.Button(level_row, text="Calibrar mesa", command=lambda: self.action(lambda: "LEVEL"))
+        self.level_button.pack(side="left", padx=(0, 6))
+        self.level_stop_button = ttk.Button(level_row, text="Parar (Esc)", command=lambda: self.action(lambda: "STOP"))
+        self.level_stop_button.pack(side="left", padx=(0, 10))
+        ttk.Label(level_row, textvariable=self.level_message).pack(side="left")
+        for label, command in (("Zerar IMU no plano atual", "IMUZERO"), ("Zerar Z relativo", "IMUYAW"),
+                               ("Limpar referência de inclinação", imu_reference_command(DEFAULT_IMU_REFERENCE))):
+            button = ttk.Button(imu_row, text=label, command=lambda cmd=command: self.imu_action(cmd))
+            button.pack(side="left", padx=(0, 6))
+            self.imu_buttons.append(button)
+        ttk.Label(imu_row, textvariable=self.imu_message).pack(side="left")
+        self.set_buttons()
+
+    def imu_action(self, command):
+        if not (self.ready and self.imu_ready and self.imu_pending is None and not self.level_running):
+            return
+        self.imu_pending = command.split()[0]
+        self.imu_command_deadline = monotonic() + 2
+        self.imu_message.set("Aguardando confirmação do Pico")
+        self.set_buttons()
+        self.send(command)
+
+    def set_motion_limits(self, enabled):
+        self.limits_enabled = enabled
+        self.limit_text.set("Reativar limites V/A" if enabled is False else "Desativar limites V/A")
+        self.limit_status.set({None: "", True: "Limites V/A ativos", False: "Limites V/A desativados"}[enabled])
+
+    def toggle_motion_limits(self):
+        if self.ready and self.limits_enabled is not None:
+            self.action(lambda: f"LIMITS {int(not self.limits_enabled)}")
+
     def run_circle(self):
         amplitude, period = [number(var.get()) for var in self.circle]
         return f"CIRCLE {amplitude:.7g} {period:.7g}"
@@ -525,6 +650,13 @@ class MotorTab:
         if self.compatible and not self.ready and now >= self.retry_at:
             self.retry_at = now + 2
             self.send("HELLO")
+        if self.compatible and not self.imu_ready and now >= self.imu_retry_at:
+            self.imu_retry_at = now + 2
+            self.send("IMUGET")
+        if self.imu_pending is not None and now >= self.imu_command_deadline:
+            self.imu_pending = None
+            self.imu_message.set("O Pico não confirmou o ajuste. Tente novamente.")
+            self.set_buttons()
 
     def action(self, make_command):
         try:
@@ -545,10 +677,14 @@ class MotorTab:
                 self.message.set(f"Motor {motor} · Aguarde a confirmação do Pico.")
                 return
             self.pending[motor] = tuple(map(float, command.split()[2:]))
-        elif command in ("CAL", "CIRCLE") or command.startswith(("GO ", "STEP ", "WAVE ")):
-            motors = MOTORS if command in ("CAL", "CIRCLE") else (int(command.split()[1]),)
+        elif command in ("CAL", "CIRCLE", "LEVEL") or command.startswith(("GO ", "STEP ", "WAVE ")):
+            motors = MOTORS if command in ("CAL", "CIRCLE", "LEVEL") else (int(command.split()[1]),)
             if not self.check_applied(motors, calibration=command == "CAL"):
+                if command == "LEVEL":
+                    self.level_message.set(self.message.get())
                 return
+            if command == "LEVEL":
+                self.level_message.set("Aguardando confirmação do Pico")
         if command.startswith("STEP "):
             self.plot_mode.set("Degrau +1°")
         elif command.startswith(("GO ", "WAVE ", "CIRCLE ")):
@@ -558,7 +694,7 @@ class MotorTab:
 
     def check_applied(self, motors, calibration=False):
         # Homing uses motion limits, duty and polarity. The position PIDF is independent.
-        fields = slice(4, None) if calibration else slice(None)
+        fields = slice(4, 10) if calibration else slice(None)
         for motor in motors:
             if motor in self.pending:
                 self.message.set(f"Motor {motor} · Aguarde a confirmação do Pico.")
@@ -584,16 +720,23 @@ class MotorTab:
         if line in LEGACY_HELLOS:
             self.connected = True
             self.compatible = self.ready = False
+            self.fast_telemetry = line in FAST_TELEMETRY_HELLOS
             self.message.set("Firmware anterior detectado. Grave o UF2 atualizado para liberar o acionamento.")
+            self.level_message.set("Grave o firmware atualizado para nivelar")
             self.set_buttons()
         elif line == PROTOCOL_HELLO:
             self.connected = True
             self.compatible = True
+            self.fast_telemetry = True
             self.ready = False
             self.retry_at = monotonic() + 2
             self.configured.clear()
             self.pending.clear()
             self.applied.clear()
+            self.imu_ready = False
+            self.imu_pending = None
+            self.imu_retry_at = monotonic() + 2
+            self.set_motion_limits(None)
             self.message.set("Sincronizando parâmetros com o Pico")
             self.set_buttons()
         elif fields[0] == "!SCALE" and len(fields) == 2:
@@ -603,7 +746,14 @@ class MotorTab:
                 return
             if resolution > 0:
                 self.set_scale(resolution)
-        elif fields[0] == "!CFG" and len(fields) == 12 and self.compatible:
+        elif fields in (["!LIMITS", "0"], ["!LIMITS", "1"]) and self.compatible:
+            self.set_motion_limits(fields[1] == "1")
+            self.set_buttons()
+        elif fields[0] == "!LEVEL" and len(fields) == 5 and self.compatible:
+            self.receive_level(fields[1:])
+        elif fields[0] == "!IMUCFG" and len(fields) == 4 and self.compatible:
+            self.receive_imu_reference(fields[1:])
+        elif fields[0] == "!CFG" and len(fields) == 13 and self.compatible:
             try:
                 motor = int(fields[1])
                 values = tuple(map(float, fields[2:]))
@@ -622,12 +772,72 @@ class MotorTab:
                 else:
                     self.pending.clear()
             self.message.set(f"{command} · {ERRORS.get(reason, reason.replace('_', ' '))}")
+            if command == "LEVEL":
+                self.level_message.set(ERRORS.get(reason, reason.replace("_", " ")))
+            if command in ("IMUZERO", "IMUYAW", "IMUCFG"):
+                self.imu_pending = None
+                self.imu_message.set(ERRORS.get(reason, reason.replace("_", " ")))
+                self.set_buttons()
         elif fields[0] == "!OK" and len(fields) == 2:
+            if fields[1] == "IMUYAW":
+                self.imu_pending = None
+                self.imu_message.set("Z relativo zerado")
+                self.set_buttons()
             if fields[1] == "STOP":
                 self.pending.clear()
+                if self.imu_pending is not None:
+                    self.imu_pending = None
+                    self.imu_message.set("Ajuste da IMU interrompido")
+                    self.set_buttons()
                 if self.compatible and not self.ready:
                     self.send("HELLO")
             self.message.set(f"Confirmado pelo Pico · {fields[1]}")
+
+    def receive_imu_reference(self, fields):
+        try:
+            values = parse_imu_reference(fields)
+        except ValueError:
+            return
+        pending = self.imu_pending
+        if pending in ("IMUZERO", "IMUCFG"):
+            self.imu_reference = values
+            temporary = IMU_REFERENCE_PATH.with_suffix(".tmp")
+            try:
+                temporary.write_text(" ".join(f"{value:.8g}" for value in values) + "\n", encoding="utf-8")
+                temporary.replace(IMU_REFERENCE_PATH)
+                self.imu_file_warning = ""
+                self.imu_message.set("Referência da IMU salva" if pending == "IMUZERO" else "Inclinação de referência restaurada")
+            except OSError as error:
+                self.imu_message.set(f"Referência aplicada. Falha ao salvar ({error}).")
+        elif not self.imu_ready and not same_settings(values, self.imu_reference):
+            self.send(imu_reference_command(self.imu_reference))
+            return
+        elif not self.imu_ready:
+            self.imu_message.set(self.imu_file_warning or ("Referência da IMU carregada"
+                                 if not same_settings(values, DEFAULT_IMU_REFERENCE) else "Montagem padrão"))
+        self.imu_ready = True
+        if pending != "IMUYAW":
+            self.imu_pending = None
+        self.set_buttons()
+
+    def receive_level(self, fields):
+        try:
+            state = int(fields[0])
+            tilt, m1, m3 = map(number, fields[1:])
+        except ValueError:
+            return
+        report = (state, tilt, m1, m3)
+        if state not in range(len(LEVEL_MESSAGES)) or report == self.level_report:
+            return
+        self.level_report = report
+        self.level_running = state in range(1, 5)
+        status = LEVEL_MESSAGES[state]
+        if tilt >= 0:
+            status += f" · Inclinação {tilt:.2f}°"
+        if state == 5:
+            status += f" · M1 {m1:.2f}° · M3 {m3:.2f}°"
+        self.level_message.set(status)
+        self.set_buttons()
 
     def confirm_settings(self, motor, values):
         pending = self.pending.pop(motor, None)
@@ -696,6 +906,7 @@ class MotorTab:
         plot_mode = self.plot_mode.get()
         show_step = plot_mode == "Degrau +1°"
         show_pwm = plot_mode == "PWM ao vivo"
+        show_travel = self.plot_units.get() == "Curso (%)"
         for motor, axis in self.axes.items():
             stream = self.samples[motor]
             if stream:
@@ -712,13 +923,17 @@ class MotorTab:
                 for trace in self.traces[motor]:
                     trace.set_visible(not show_pwm)
                 self.pwm_traces[motor].set_visible(show_pwm)
-                axis.set_ylabel("PWM (%)" if show_pwm else "Posição (°)")
                 axis.legend(handles=[self.pwm_traces[motor]] if show_pwm else self.traces[motor], fontsize=8)
+            axis.set_ylabel("PWM (%)" if show_pwm else "Curso (%)" if show_travel else "Posição (°)")
             if show_pwm:
                 self.pwm_traces[motor].set_data(times, [row.pwm for row in rows])
             else:
                 for trace, field in zip(self.traces[motor], ("goal", "reference", "angle")):
-                    trace.set_data(times, [getattr(row, field) for row in rows])
+                    data = [getattr(row, field) for row in rows]
+                    if show_travel:
+                        data = [100 * value / row.span if row.calibrated == 3 and row.span > 0 else float("nan")
+                                for value, row in zip(data, rows)]
+                    trace.set_data(times, data)
             axis.set_xlim((0, 6) if show_step else (-10, 0))
             axis.relim(visible_only=True)
             axis.autoscale_view(scalex=False)

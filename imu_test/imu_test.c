@@ -21,8 +21,10 @@
 #define I2C_TIMEOUT_US 5000u
 #define ENCODER_SPEED_WINDOW_MS 200u
 #define IMU_PERIOD_MS 20u
-#define LOG_PERIOD_MS 40u
+#define STANDARD_GRAVITY_MPS2 9.80665f
+#define LOG_PERIOD_MS 20u
 #define CALIBRATION_SAMPLES (2000u / IMU_PERIOD_MS)
+#define REFERENCE_SAMPLES (2000u / IMU_PERIOD_MS)
 
 #define CORE_0 (1u << 0)
 #define CORE_1 (1u << 1)
@@ -92,6 +94,10 @@ typedef struct {
 
 static Telemetry telemetry;
 static critical_section_t telemetry_lock;
+static Vec3 imu_reference = {.z = 1};
+static Vec3 stationary_accel;
+static uint64_t stationary_at;
+static unsigned heading_epoch;
 
 static void init_encoders(void)
 {
@@ -231,16 +237,15 @@ static bool read_sample(uint8_t address, Sample *sample)
     if (!read_registers(address, REG_ACCEL_XOUT_H, raw, sizeof raw)) {
         return false;
     }
-    sample->accel = (Vec3){
-        read_i16(raw) / 16384.0f,
-        read_i16(raw + 2) / 16384.0f,
-        read_i16(raw + 4) / 16384.0f,
-    };
+    // Rotate the mounted sensor 180 degrees about X into the table frame.
+    const float accel_per_count = STANDARD_GRAVITY_MPS2 / 16384.0f;
+    sample->accel = (Vec3){read_i16(raw) * accel_per_count, -read_i16(raw + 2) * accel_per_count,
+                          -read_i16(raw + 4) * accel_per_count};
     // Bytes 6 and 7 contain temperature.
     sample->gyro = (Vec3){
         read_i16(raw + 8) / 131.0f,
-        read_i16(raw + 10) / 131.0f,
-        read_i16(raw + 12) / 131.0f,
+        -read_i16(raw + 10) / 131.0f,
+        -read_i16(raw + 12) / 131.0f,
     };
     return true;
 }
@@ -253,6 +258,56 @@ static float magnitude(Vec3 vector)
 static float distance(Vec3 a, Vec3 b)
 {
     return magnitude((Vec3){a.x - b.x, a.y - b.y, a.z - b.z});
+}
+
+static bool valid_reference(Vec3 direction)
+{
+    const float norm = magnitude(direction);
+    return norm >= .99f && norm <= 1.01f && direction.z >= .8f * norm;
+}
+
+bool imu_capture_reference(uint64_t now)
+{
+    critical_section_enter_blocking(&telemetry_lock);
+    const bool fresh = telemetry.imu_state == IMU_READY && stationary_at != 0
+        && (now <= stationary_at || now - stationary_at <= 100000u);
+    const float norm = fresh ? magnitude(stationary_accel) : 1;
+    const Vec3 direction = {stationary_accel.x / norm, stationary_accel.y / norm, stationary_accel.z / norm};
+    const bool accepted = fresh && valid_reference(direction);
+    if (accepted) {
+        imu_reference = direction;
+        ++heading_epoch;
+    }
+    critical_section_exit(&telemetry_lock);
+    return accepted;
+}
+
+bool imu_set_reference(float x, float y, float z)
+{
+    const Vec3 direction = {x, y, z};
+    if (!valid_reference(direction)) {
+        return false;
+    }
+    const float norm = magnitude(direction);
+    critical_section_enter_blocking(&telemetry_lock);
+    imu_reference = (Vec3){x / norm, y / norm, z / norm};
+    critical_section_exit(&telemetry_lock);
+    return true;
+}
+
+void imu_zero_heading(void)
+{
+    critical_section_enter_blocking(&telemetry_lock);
+    ++heading_epoch;
+    critical_section_exit(&telemetry_lock);
+}
+
+void imu_send_reference(void)
+{
+    critical_section_enter_blocking(&telemetry_lock);
+    const Vec3 direction = imu_reference;
+    critical_section_exit(&telemetry_lock);
+    printf("!IMUCFG,%.8g,%.8g,%.8g\n", direction.x, direction.y, direction.z);
 }
 
 static bool calibrate(uint8_t address, Vec3 *bias, Vec3 *initial_accel)
@@ -273,10 +328,10 @@ static bool calibrate(uint8_t address, Vec3 *bias, Vec3 *initial_accel)
         if (count == 0) {
             reference = sample;
         }
-        if (fabsf(magnitude(sample.accel) - 1.0f) > 0.15f
+        if (fabsf(magnitude(sample.accel) - LOCAL_GRAVITY_MPS2) > .15f * LOCAL_GRAVITY_MPS2
             || magnitude(sample.gyro) > 30.0f
             || distance(sample.gyro, reference.gyro) > 2.0f
-            || distance(sample.accel, reference.accel) > 0.05f) {
+            || distance(sample.accel, reference.accel) > .05f * LOCAL_GRAVITY_MPS2) {
             gyro_sum = (Vec3){0};
             accel_sum = (Vec3){0};
             count = 0;
@@ -292,7 +347,7 @@ static bool calibrate(uint8_t address, Vec3 *bias, Vec3 *initial_accel)
     }
 
     *bias = (Vec3){gyro_sum.x / count, gyro_sum.y / count, gyro_sum.z / count};
-    *initial_accel = accel_sum;
+    *initial_accel = (Vec3){accel_sum.x / count, accel_sum.y / count, accel_sum.z / count};
     return true;
 }
 
@@ -316,9 +371,9 @@ static Quaternion update_attitude(Quaternion q, Sample sample, float dt)
     };
 
     // Compare the accelerometer with the estimated upward direction in sensor axes.
-    // Reduce the correction as the measured acceleration moves away from 1 g.
+    // Reduce the correction as the measured acceleration moves away from local gravity.
     const float norm = magnitude(sample.accel);
-    const float weight = 1.0f - fabsf(norm - 1.0f) / 0.20f;
+    const float weight = 1.0f - fabsf(norm - LOCAL_GRAVITY_MPS2) / (.20f * LOCAL_GRAVITY_MPS2);
     if (weight > 0.0f) {
         const Vec3 up = {
             2.0f * (q.x * q.z - q.w * q.y),
@@ -362,38 +417,101 @@ static Vec3 euler_degrees(Quaternion q)
     };
 }
 
+static Quaternion mounting_rotation(Vec3 up)
+{
+    // Shortest rotation from table +Z to the calibrated direction in sensor axes.
+    const float scale = sqrtf(2 * (1 + up.z));
+    return (Quaternion){.5f * scale, -up.y / scale, up.x / scale, 0};
+}
+
+static Quaternion compose_rotation(Quaternion a, Quaternion b)
+{
+    return (Quaternion){
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+    };
+}
+
+static Vec3 to_table_axes(Quaternion mounting, Vec3 v)
+{
+    const Quaternion inverse = {mounting.w, -mounting.x, -mounting.y, -mounting.z};
+    const Quaternion p = compose_rotation(compose_rotation(inverse, (Quaternion){0, v.x, v.y, v.z}), mounting);
+    return (Vec3){p.x, p.y, p.z};
+}
+
 static void publish_imu_state(ImuState state)
 {
     critical_section_enter_blocking(&telemetry_lock);
     telemetry.imu_state = state;
+    stationary_at = 0;
     critical_section_exit(&telemetry_lock);
 }
 
 static void sample_imu(uint8_t address, Vec3 bias, Vec3 initial_accel)
 {
     Quaternion attitude = initial_attitude(initial_accel);
+    const float accel_scale = LOCAL_GRAVITY_MPS2 / magnitude(initial_accel);
     uint64_t last_sample_us = time_us_64();
+    Vec3 reference_anchor = {0}, reference_mean = {0};
+    unsigned quiet_samples = 0, applied_heading_epoch = 0;
+    float heading_zero = 0;
     TickType_t wake = xTaskGetTickCount();
 
     while (true) {
         xTaskDelayUntil(&wake, pdMS_TO_TICKS(IMU_PERIOD_MS));
         Sample sample;
-        const uint64_t now_us = time_us_64();
         if (!read_sample(address, &sample)) {
             return;
         }
+        const uint64_t now_us = time_us_64();
+        sample.accel.x *= accel_scale;
+        sample.accel.y *= accel_scale;
+        sample.accel.z *= accel_scale;
         sample.gyro.x -= bias.x;
         sample.gyro.y -= bias.y;
         sample.gyro.z -= bias.z;
         attitude = update_attitude(attitude, sample, (now_us - last_sample_us) * 1e-6f);
         last_sample_us = now_us;
 
-        const Vec3 angle = euler_degrees(attitude);
+        const float gyro_norm = magnitude(sample.gyro);
+        if (gyro_norm > .8f || fabsf(magnitude(sample.accel) - LOCAL_GRAVITY_MPS2) > .04f * LOCAL_GRAVITY_MPS2) {
+            quiet_samples = 0;
+        } else {
+            if (quiet_samples == 0 || distance(sample.accel, reference_anchor) > .02f * LOCAL_GRAVITY_MPS2) {
+                reference_anchor = reference_mean = sample.accel;
+                quiet_samples = 0;
+            }
+            if (quiet_samples < REFERENCE_SAMPLES) {
+                ++quiet_samples;
+            }
+            reference_mean.x += (sample.accel.x - reference_mean.x) / quiet_samples;
+            reference_mean.y += (sample.accel.y - reference_mean.y) / quiet_samples;
+            reference_mean.z += (sample.accel.z - reference_mean.z) / quiet_samples;
+        }
+        critical_section_enter_blocking(&telemetry_lock);
+        const Vec3 reference = imu_reference;
+        const unsigned yaw_epoch = heading_epoch;
+        stationary_accel = reference_mean;
+        stationary_at = quiet_samples == REFERENCE_SAMPLES ? now_us : 0;
+        critical_section_exit(&telemetry_lock);
+
+        const Quaternion mounting = mounting_rotation(reference);
+        Vec3 angle = euler_degrees(compose_rotation(attitude, mounting));
+        if (yaw_epoch != applied_heading_epoch) {
+            heading_zero = angle.z;
+            applied_heading_epoch = yaw_epoch;
+        }
+        angle.z = remainderf(angle.z - heading_zero, 360);
+        sample.accel = to_table_axes(mounting, sample.accel);
+        sample.gyro = to_table_axes(mounting, sample.gyro);
         critical_section_enter_blocking(&telemetry_lock);
         telemetry.imu = sample;
         telemetry.angles = angle;
         telemetry.imu_state = IMU_READY;
         critical_section_exit(&telemetry_lock);
+        motor_imu_sample(sample.accel.x, sample.accel.y, sample.accel.z, gyro_norm, now_us);
     }
 }
 
@@ -474,7 +592,7 @@ static void communication_task(void *parameter)
         }
         if (!connected) {
             connected = true;
-            puts("accelx,accely,accelz,gyrox,gyroy,gyroz,angx,angy,angz,"
+            puts("accelx_mps2,accely_mps2,accelz_mps2,gyrox,gyroy,gyroz,angx,angy,angz,"
                  "m1_count,m1_pulses_a,m1_pulses_b,m1_angle_deg,m1_rpm,"
                  "m3_count,m3_pulses_a,m3_pulses_b,m3_angle_deg,m3_rpm,"
                  "m1_min,m1_max,m3_min,m3_max,imu_state,"
