@@ -22,7 +22,7 @@
 
 /* 1000 ticks por segundo: cada tick representa 1 ms. */
 #define configTICK_RATE_HZ                           1000
-#define configMAX_PRIORITIES                         5
+#define configMAX_PRIORITIES                         6
 #define configMINIMAL_STACK_SIZE                     256
 #define configMAX_TASK_NAME_LEN                      16
 #define configTICK_TYPE_WIDTH_IN_BITS                TICK_TYPE_WIDTH_32_BITS

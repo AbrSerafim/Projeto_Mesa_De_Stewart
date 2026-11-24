@@ -1,0 +1,726 @@
+"""Comunicação e interface de acionamento dos motores da mesa."""
+
+from collections import deque
+from math import isclose, isfinite
+from pathlib import Path
+from queue import Empty, Queue
+from threading import Event, Thread
+from time import monotonic
+from typing import NamedTuple
+from tkinter import BooleanVar, DoubleVar, StringVar, TclError, messagebox, ttk
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+
+MOTORS = (1, 3)
+PROTOCOL_HELLO = b"!HELLO,5"
+LEGACY_HELLOS = (b"!HELLO,1", b"!HELLO,2", b"!HELLO,3", b"!HELLO,4")
+ENCODER_RESOLUTION_DEG = .28125
+SETTINGS_PATH = Path(__file__).with_name("parametros_motores.txt")
+DEFAULTS = dict.fromkeys(MOTORS, (4, 0, 0, .05, 30, 90, 8, 4, 30, 1))
+PROFILE_HEADER = "# PIDF externo em graus, saida em graus/s. PI interno gera PWM."
+MODES = ("Freio dinâmico", "Livre", "Calibração", "Posição", "Degrau", "Seno", "Cosseno", "Rampa")
+PHASES = ("busca rápida", "recuo", "busca lenta", "liberação da chave")
+FAULTS = (
+    "", "conexão perdida", "dois fins de curso ativos", "fim de curso inesperado na calibração",
+    "tempo de calibração excedido", "leitura do encoder atrasada", "encoder sem movimento",
+    "curso menor que 16 contagens", "fim de curso fora da posição calibrada",
+    "velocidade excessiva", "encoder fora do curso calibrado",
+)
+ERRORS = {
+    "libere_os_fins_de_curso": "Libere os fins de curso antes de calibrar.",
+    "freio_necessario": "Acione o freio antes de repetir a operação.",
+    "calibracao_ou_freio_necessario": "Calibre o curso e acione o freio se o motor estiver livre.",
+    "freio_e_motor_parado_necessarios": "Acione o freio e aguarde o motor parar.",
+    "alvo_fora_do_curso": "O alvo ultrapassa o curso calibrado.",
+    "teste_fora_da_faixa": "O teste ultrapassa o curso ou o tempo permitido.",
+    "configuracao_fora_da_faixa": "Revise os parâmetros.",
+    "calibracao_em_andamento": "A calibração está em andamento.",
+    "fins_simultaneos": "Há dois fins de curso ativos no mesmo motor.",
+    "sem_sessao": "A sessão serial foi interrompida.",
+    "ganhos_ou_pwm_zerados": "Aplique pelo menos um ganho e um limite de PWM maior que zero.",
+    "pwm_zerado": "Aplique um limite de PWM maior que zero nos dois motores para calibrar.",
+}
+
+FIELDS = (
+    ("Kp", 0, 1000), ("Ki", 0, 5000), ("Kd", -100, 100), ("Tf (s)", 0, 2),
+    ("V máx. °/s", 2, 360), ("A máx. °/s²", 1, 2000),
+    ("Cal. rápida °/s", 2, 360), ("Cal. lenta °/s", 2, 360), ("PWM máx. %", 0, 100),
+)
+
+
+def settings_errors(values):
+    if len(values) != 10 or not all(map(isfinite, values)):
+        return ["Preencha todos os parâmetros com valores finitos."]
+    errors = [f"{name} deve ficar entre {low:g} e {high:g} (informado {value:g})."
+              for (name, low, high), value in zip(FIELDS, values) if not low <= value <= high]
+    _, _, kd, tf, speed, _, fast, slow, _, polarity = values
+    if kd != 0 and tf < .0001:
+        errors.append("Tf deve ser de pelo menos 0,0001 s quando Kd estiver ativo.")
+    if fast > speed:
+        errors.append(f"Cal. rápida ({fast:g} °/s) excede V máx. ({speed:g} °/s).")
+    if slow > fast:
+        errors.append(f"Cal. lenta ({slow:g} °/s) excede Cal. rápida ({fast:g} °/s).")
+    if polarity not in (-1, 1):
+        errors.append("Polaridade inválida.")
+    return errors
+
+
+def load_settings(path=SETTINGS_PATH):
+    settings = DEFAULTS.copy()
+    if not path.exists():
+        return settings, ""
+    try:
+        seen = set()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        legacy = PROFILE_HEADER not in lines
+        for line in lines:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            motor, *raw = line.split()
+            motor = int(motor)
+            values = tuple(map(float, raw))
+            if motor not in MOTORS or motor in seen or settings_errors(values):
+                raise ValueError(f"parâmetros inválidos para o motor {motor}")
+            if legacy:
+                values = (*DEFAULTS[motor][:4], *values[4:])
+            settings[motor] = values
+            seen.add(motor)
+        warning = "Ganhos antigos substituídos pelos iniciais da malha em cascata." if legacy and seen else ""
+        return settings, warning
+    except (OSError, ValueError) as error:
+        return DEFAULTS.copy(), f"Falha ao ler {path.name} ({error}). Padrões carregados."
+
+
+def save_settings(settings, path=SETTINGS_PATH):
+    content = (PROFILE_HEADER + "\n"
+               "# Motor Kp Ki Kd Tf Vmax Amax Vcal_rapida Vcal_lenta PWMmax Polaridade\n")
+    content += "".join(f"{motor} " + " ".join(f"{x:.7g}" for x in settings[motor]) + "\n"
+                       for motor in MOTORS)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
+def same_settings(first, second):
+    return all(isclose(a, b, rel_tol=1e-6, abs_tol=1e-8) for a, b in zip(first, second))
+
+
+class SerialSession:
+    """Mantém RX, TX e heartbeat fora do thread do Tk."""
+
+    def __init__(self, port, framer):
+        self.port = port
+        self.device = port.port
+        self.framer = framer
+        self.incoming = deque(maxlen=4096)
+        self.outgoing = Queue()
+        self.stopping = Event()
+        self.braking = Event()
+        self.ui_at = monotonic()
+        self.error = None
+        self.thread = Thread(target=self.run, name="serial-pico", daemon=True)
+        self.thread.start()
+
+    def send(self, command):
+        if command == "STOP":
+            self.braking.set()
+        else:
+            self.outgoing.put(command)
+
+    def discard_commands(self):
+        while True:
+            try:
+                self.outgoing.get_nowait()
+            except Empty:
+                return
+
+    def write(self, command):
+        self.port.write((command + "\n").encode("ascii"))
+
+    def run(self):
+        hello = False
+        ui_stopped = False
+        next_ping = next_hello = 0
+        try:
+            while not self.stopping.is_set():
+                now = monotonic()
+                if self.braking.is_set():
+                    self.braking.clear()
+                    self.discard_commands()
+                    self.write("STOP")
+                if not hello and now >= next_hello:
+                    self.write("HELLO")
+                    next_hello = now + 1
+                if hello and now >= next_ping:
+                    self.write("PING")
+                    next_ping = now + .15
+                if now - self.ui_at < 1.25:
+                    ui_stopped = False
+                    if hello:
+                        for _ in range(4):
+                            if self.braking.is_set():
+                                break
+                            try:
+                                command = self.outgoing.get_nowait()
+                            except Empty:
+                                break
+                            self.write(command)
+                else:
+                    self.discard_commands()
+                    if hello and not ui_stopped:
+                        self.write("STOP")
+                        ui_stopped = True
+                chunk = self.port.read(min(self.port.in_waiting or 1, 16384))
+                for line in self.framer.feed(chunk):
+                    if line == PROTOCOL_HELLO or line in LEGACY_HELLOS:
+                        hello = True
+                        next_ping = 0
+                    elif line == b"!ERR,PING,sem_sessao":
+                        if not hello:
+                            continue
+                        hello = False
+                        next_hello = 0
+                        self.discard_commands()
+                    self.incoming.append(line)
+        except OSError as error:
+            self.error = str(error)
+        finally:
+            try:
+                if self.stopping.is_set():
+                    self.write("STOP")
+            except OSError:
+                pass
+            finally:
+                self.port.close()
+
+    def close(self):
+        self.stopping.set()
+        self.thread.join(timeout=.35)
+
+
+class MotorSample(NamedTuple):
+    motor: int
+    timestamp: int
+    mode: int
+    fault: int
+    calibrated: int
+    limits: int
+    phase: int
+    endpoint: int
+    angle: float
+    goal: float
+    reference: float
+    speed: float
+    span: float
+    pwm: float
+    step: int
+    elapsed: float
+    enable: int = -1
+    fault_speed: float = 0
+    fault_threshold: float = 0
+    speed_setpoint: float = 0
+
+    @classmethod
+    def parse(cls, fields):
+        try:
+            if len(fields) not in (16, 17, 19, 20):
+                return None
+            sample = cls(*map(int, fields[:8]), *map(float, fields[8:14]),
+                         int(fields[14]), float(fields[15]), *map(int, fields[16:17]),
+                         *map(float, fields[17:]))
+            if (sample.motor in MOTORS and 0 <= sample.mode < len(MODES)
+                    and 0 <= sample.fault < len(FAULTS) and 0 <= sample.phase < len(PHASES)
+                    and sample.enable in (-1, 0, 1)
+                    and all(map(isfinite, (*sample[8:14], sample.elapsed,
+                                          sample.fault_speed, sample.fault_threshold, sample.speed_setpoint)))):
+                return sample
+        except (ValueError, IndexError, TypeError):
+            pass
+        return None
+
+
+def step_metrics(samples, complete, resolution=ENCODER_RESOLUTION_DEG):
+    if len(samples) < 2:
+        return "Aguardando amostras"
+    target = samples[0].goal
+    initial = target - 1
+
+    def crossing(level):
+        if samples[0].angle >= level:
+            return 0.0
+        for before, after in zip(samples, samples[1:]):
+            if before.angle < level <= after.angle:
+                ratio = (level - before.angle) / (after.angle - before.angle)
+                return before.elapsed + ratio * (after.elapsed - before.elapsed)
+        return None
+
+    t10, t90 = crossing(initial + .1), crossing(initial + .9)
+    rise = f"{t90 - t10:.2f} s" if t10 is not None and t90 is not None else "—"
+    peak = max(samples, key=lambda row: row.angle)
+    overshoot = 100 * max(0, peak.angle - target)
+    tail = [row.angle for row in samples if samples[-1].elapsed - row.elapsed <= .5]
+    error = f"{target - sum(tail) / len(tail):+.3f}°" if complete else "—"
+    settling = "—"
+    if complete:
+        last_outside = max((i for i, sample in enumerate(samples)
+                            if abs(sample.angle - target) > resolution), default=-1)
+        if last_outside + 1 < len(samples):
+            first_inside = samples[last_outside + 1].elapsed
+            if samples[-1].elapsed - first_inside >= .5:
+                settling = f"{first_inside:.2f} s"
+    return (f"Subida 10–90% {rise}  |  Sobressinal {overshoot:.1f}%  |  "
+            f"Pico {peak.elapsed:.2f} s  |  Erro final {error}  |  "
+            f"Acomodação (±1 cont.) {settling}")
+
+
+class MotorPanel:
+    def __init__(self, parent, motor, action, save):
+        self.motor = motor
+        self.action = action
+        self.buttons = []
+        self.frame = ttk.LabelFrame(parent, text=f"Motor {motor}", padding=7)
+        self.status = StringVar(value="Aguardando firmware de acionamento")
+        ttk.Label(self.frame, textvariable=self.status, wraplength=440).pack(anchor="w")
+        gains = ttk.LabelFrame(self.frame, text="PIDF de posição · saída em °/s", padding=3)
+        gains.pack(fill="x", pady=(4, 2))
+        self.gains = [StringVar() for _ in range(4)]
+        for index, (name, variable) in enumerate(zip(("Kp", "Ki", "Kd", "Tf (s)"), self.gains)):
+            gains.columnconfigure(index, weight=1)
+            ttk.Label(gains, text=name).grid(row=0, column=index, sticky="w")
+            ttk.Entry(gains, textvariable=variable, width=8).grid(row=1, column=index, sticky="ew", padx=(0, 4))
+        self.gain_status = StringVar()
+        ttk.Label(gains, textvariable=self.gain_status).grid(row=2, columnspan=4, sticky="w")
+        sliders = ttk.Frame(self.frame)
+        sliders.pack(fill="x")
+        sliders.columnconfigure(1, weight=1)
+        sliders.columnconfigure(4, weight=1)
+        self.sliders = []
+        for index, (name, lower, upper) in enumerate(FIELDS[4:]):
+            row, column = divmod(index, 2)
+            column *= 3
+            var = DoubleVar()
+            ttk.Label(sliders, text=name).grid(row=row, column=column, sticky="w")
+            ttk.Scale(sliders, from_=lower, to=upper, variable=var, length=60,
+                      command=lambda value, var=var: var.set(round(float(value), 2))).grid(
+                row=row, column=column + 1, padx=2, sticky="ew")
+            spinbox = ttk.Spinbox(sliders, from_=lower, to=upper, textvariable=var, width=6, increment=1)
+            spinbox.grid(row=row, column=column + 2, padx=(0, 6))
+            self.sliders.append((var, spinbox))
+        settings = ttk.Frame(self.frame)
+        settings.pack(fill="x", pady=3)
+        self.active_limits = StringVar(value="Aguardando limites confirmados pelo Pico")
+        ttk.Label(settings, textvariable=self.active_limits).pack(side="top", anchor="w", pady=(0, 3))
+        self.invert = BooleanVar()
+        ttk.Checkbutton(settings, text="Inverter sentido", variable=self.invert).pack(side="left")
+        self.button(settings, "Salvar", lambda: save(motor), side="right", padx=(4, 0))
+        self.button(settings, "Aplicar", lambda: action(self.apply), side="right", padx=(4, 0))
+        ttk.Button(settings, text="Zerar PIDF", command=self.zero_gains).pack(side="right")
+
+        go = ttk.Frame(self.frame)
+        go.pack(fill="x", pady=2)
+        self.target = StringVar(value="50")
+        self.units = StringVar(value="% curso")
+        ttk.Label(go, text="Alvo").pack(side="left")
+        ttk.Entry(go, width=7, textvariable=self.target).pack(side="left", padx=4)
+        ttk.Combobox(go, width=10, state="readonly", values=("% curso", "° desde mín."),
+                     textvariable=self.units).pack(side="left")
+        self.button(go, "Mover", lambda: action(self.go), side="left", padx=4)
+        self.button(go, "Degrau +1°", lambda: action(lambda: f"STEP {motor}"), side="right")
+
+        wave = ttk.Frame(self.frame)
+        wave.pack(fill="x", pady=2)
+        self.wave = StringVar(value="Seno")
+        ttk.Combobox(wave, width=9, state="readonly", values=("Seno", "Cosseno", "Rampa"),
+                     textvariable=self.wave).pack(side="left")
+        self.wave_values = [StringVar(value=value) for value in ("3", "1", "4")]
+        for label, var in zip(("Base °", "Δ °", "Tempo s"), self.wave_values):
+            ttk.Label(wave, text=label).pack(side="left", padx=(4, 2))
+            ttk.Entry(wave, width=5, textvariable=var).pack(side="left")
+        self.button(wave, "Iniciar", lambda: action(self.run_wave), side="right")
+
+    def button(self, parent, label, callback, **pack):
+        button = ttk.Button(parent, text=label, command=callback, state="disabled")
+        button.pack(**pack)
+        self.buttons.append(button)
+
+    def set_values(self, values):
+        for var, value in zip(self.gains, values[:4]):
+            var.set(f"{value:.7g}")
+        for (var, _), value in zip(self.sliders, values[4:9]):
+            var.set(value)
+        self.invert.set(values[9] == -1)
+
+    def zero_gains(self):
+        for variable in self.gains:
+            variable.set("0")
+
+    def describe_applied_gain(self, values, resolution):
+        proportional = values[0] * resolution
+        self.gain_status.set(f"P por contagem {proportional:.2f} °/s · teto de velocidade {values[4]:g} °/s")
+        speed, accel, fast, slow, duty = values[4:9]
+        self.active_limits.set(f"No Pico · V máx. {speed:g} °/s · A máx. {accel:g} °/s²"
+                               f" · Cal. {fast:g}/{slow:g} °/s · PWM {duty:g}%")
+
+    def values(self):
+        values = []
+        fields = self.gains + [spinbox for _, spinbox in self.sliders]
+        for (name, _, _), entry in zip(FIELDS, fields):
+            try:
+                values.append(number(entry.get()))
+            except ValueError as error:
+                raise ValueError(f"{name} requer um número finito.") from error
+        values = (*values, -1 if self.invert.get() else 1)
+        errors = settings_errors(values)
+        if errors:
+            raise ValueError(" ".join(errors))
+        return values
+
+    def apply(self):
+        return cfg_command(self.motor, self.values())
+
+    def go(self):
+        return f"GO {self.motor} {int(self.units.get() == '% curso')} {number(self.target.get()):.7g}"
+
+    def run_wave(self):
+        kind = ("Seno", "Cosseno", "Rampa").index(self.wave.get())
+        args = " ".join(f"{number(var.get()):.7g}" for var in self.wave_values)
+        return f"WAVE {self.motor} {kind} {args}"
+
+    def update(self, sample):
+        state = MODES[sample.mode]
+        if sample.mode == 2:
+            endpoint = "mínimo" if sample.endpoint == 1 else "máximo"
+            state += f" ({endpoint}, {PHASES[sample.phase]})"
+        if sample.fault:
+            state += f" · {FAULTS[sample.fault]}"
+        if sample.fault_threshold > 0:
+            state += f" ({sample.fault_speed:.1f} > {sample.fault_threshold:.1f} °/s)"
+        bounds = {0: "livres", 1: "mín.", 2: "máx.", 3: "ambos"}.get(sample.limits, "—")
+        position = f"{sample.angle:.2f}° / {sample.span:.2f}°" if sample.calibrated == 3 else "curso pendente"
+        enable = f"  |  EN na Pico: {sample.enable}" if sample.enable >= 0 else ""
+        speed_reference = f"  |  Ref. {sample.speed_setpoint:+.1f} °/s" if sample.mode >= 3 else ""
+        self.status.set(f"{state}  |  {position}  |  Fins {bounds}\n"
+                        f"{sample.speed:+.1f} °/s{speed_reference}  |  PWM {sample.pwm:+.1f}%{enable}")
+
+
+def number(raw):
+    value = float(raw.replace(",", "."))
+    if not isfinite(value):
+        raise ValueError("Use um valor numérico finito.")
+    return value
+
+
+def cfg_command(motor, values):
+    return f"CFG {motor} " + " ".join(f"{value:.7g}" for value in values)
+
+
+class MotorTab:
+    def __init__(self, parent, send):
+        self.send = send
+        self.settings, warning = load_settings()
+        self.configured = set()
+        self.pending = {}
+        self.applied = {}
+        self.connected = False
+        self.ready = False
+        self.message = StringVar(value=warning or "Aguardando sessão de acionamento")
+        self.warning = warning
+        self.toolbar = ttk.Frame(parent)
+        self.toolbar.pack(fill="x")
+        self.buttons = []
+        for text, command in (("Parar motores (Esc)", "STOP"), ("Soltar motores", "COAST"),
+                              ("Calibrar M1 → M3", "CAL")):
+            button = ttk.Button(self.toolbar, text=text, command=lambda cmd=command: self.action(lambda: cmd),
+                                state="disabled")
+            button.pack(side="left", padx=(0, 5))
+            self.buttons.append(button)
+        self.circle = [StringVar(value="1"), StringVar(value="5")]
+        for label, var in zip(("Amplitude °", "Período s"), self.circle):
+            ttk.Label(self.toolbar, text=label).pack(side="left", padx=(4, 2))
+            ttk.Entry(self.toolbar, width=5, textvariable=var).pack(side="left")
+        button = ttk.Button(self.toolbar, text="Seno + cosseno", state="disabled",
+                            command=lambda: self.action(self.run_circle))
+        button.pack(side="left", padx=4)
+        self.buttons.append(button)
+        ttk.Label(parent, textvariable=self.message).pack(anchor="w", pady=4)
+        layout = ttk.Frame(parent)
+        layout.pack(fill="x")
+        self.panels = {}
+        for column, motor in enumerate(MOTORS):
+            panel = MotorPanel(layout, motor, self.action, self.save_motor)
+            layout.columnconfigure(column, weight=1, uniform="controle")
+            panel.frame.grid(row=0, column=column, sticky="nsew", padx=3)
+            panel.set_values(self.settings[motor])
+            self.panels[motor] = panel
+
+        plot_bar = ttk.Frame(parent)
+        plot_bar.pack(fill="x", pady=(6, 0))
+        self.plot_mode = StringVar(value="Degrau +1°")
+        ttk.Combobox(plot_bar, textvariable=self.plot_mode, state="readonly", width=16,
+                     values=("Degrau +1°", "Movimento ao vivo", "PWM ao vivo")).pack(side="left")
+        self.scale_label = StringVar()
+        ttk.Label(plot_bar, textvariable=self.scale_label).pack(side="left", padx=8)
+        self.metrics = {motor: StringVar() for motor in MOTORS}
+        for motor, metric in self.metrics.items():
+            ttk.Label(parent, textvariable=metric).pack(anchor="w")
+            metric.set(f"M{motor} · Aguardando degrau")
+        figure = Figure(figsize=(9, 2.8), layout="constrained")
+        self.axes = dict(zip(MOTORS, figure.subplots(1, 2)))
+        self.traces = {}
+        self.pwm_traces = {}
+        self.showing_pwm = False
+        for motor, axis in self.axes.items():
+            axis.set(title=f"Motor {motor}", ylabel="Posição (°)", xlabel="Tempo (s)")
+            axis.grid(alpha=.25)
+            self.traces[motor] = [axis.plot([], [], style, label=label)[0] for style, label in (
+                ("--", "Alvo"), (":", "Referência limitada"), ("-", "Encoder"),
+            )]
+            self.pwm_traces[motor], = axis.plot([], [], color="tab:purple", label="PWM aplicado", visible=False)
+            axis.legend(handles=self.traces[motor], fontsize=8)
+        self.canvas = FigureCanvasTkAgg(figure, master=parent)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.reset()
+
+    def set_buttons(self):
+        for index, button in enumerate(self.buttons):
+            enabled = self.connected if index == 0 else self.ready
+            button.configure(state="normal" if enabled else "disabled")
+        for panel in self.panels.values():
+            for button in panel.buttons:
+                button.configure(state="normal" if self.ready else "disabled")
+
+    def reset(self):
+        self.ready = self.connected = False
+        self.compatible = False
+        self.retry_at = 0
+        self.configured.clear()
+        self.pending.clear()
+        self.applied.clear()
+        self.samples = {motor: deque(maxlen=500) for motor in MOTORS}
+        self.steps = {motor: [] for motor in MOTORS}
+        self.step_result = {motor: "" for motor in MOTORS}
+        self.set_scale(ENCODER_RESOLUTION_DEG)
+        self.message.set(self.warning or "Aguardando sessão de acionamento")
+        for motor, panel in self.panels.items():
+            panel.status.set("Aguardando firmware de acionamento")
+            panel.gain_status.set("")
+            panel.active_limits.set("Aguardando limites confirmados pelo Pico")
+            self.metrics[motor].set(f"M{motor} · Aguardando degrau")
+        self.set_buttons()
+
+    def set_scale(self, resolution):
+        self.resolution = resolution
+        self.scale_label.set(f"Encoder {resolution:.5g}°/contagem · Acomodação em ±1 contagem")
+        for motor, values in self.applied.items():
+            self.panels[motor].describe_applied_gain(values, resolution)
+
+    def run_circle(self):
+        amplitude, period = [number(var.get()) for var in self.circle]
+        return f"CIRCLE {amplitude:.7g} {period:.7g}"
+
+    def check_sync(self, now):
+        if self.compatible and not self.ready and now >= self.retry_at:
+            self.retry_at = now + 2
+            self.send("HELLO")
+
+    def action(self, make_command):
+        try:
+            command = make_command()
+        except (ValueError, ArithmeticError, TclError) as error:
+            self.message.set(f"Entrada inválida. {error}")
+            return
+        if not (self.ready or self.connected and command == "STOP"):
+            return
+        if command == "COAST" and not messagebox.askyesno(
+            "Soltar motores", "A mesa pode se mover com o próprio peso. Soltar os dois motores?",
+            parent=self.toolbar,
+        ):
+            return
+        if command.startswith("CFG "):
+            motor = int(command.split()[1])
+            if motor in self.pending:
+                self.message.set(f"Motor {motor} · Aguarde a confirmação do Pico.")
+                return
+            self.pending[motor] = tuple(map(float, command.split()[2:]))
+        elif command in ("CAL", "CIRCLE") or command.startswith(("GO ", "STEP ", "WAVE ")):
+            motors = MOTORS if command in ("CAL", "CIRCLE") else (int(command.split()[1]),)
+            if not self.check_applied(motors, calibration=command == "CAL"):
+                return
+        if command.startswith("STEP "):
+            self.plot_mode.set("Degrau +1°")
+        elif command.startswith(("GO ", "WAVE ", "CIRCLE ")):
+            self.plot_mode.set("Movimento ao vivo")
+        self.send(command)
+        self.message.set(f"Enviado · {command.split()[0]}")
+
+    def check_applied(self, motors, calibration=False):
+        # Homing uses motion limits, duty and polarity. The position PIDF is independent.
+        fields = slice(4, None) if calibration else slice(None)
+        for motor in motors:
+            if motor in self.pending:
+                self.message.set(f"Motor {motor} · Aguarde a confirmação do Pico.")
+                return False
+            try:
+                edited = self.panels[motor].values()
+            except (ValueError, TclError) as error:
+                self.message.set(f"Motor {motor} · {error}")
+                return False
+            applied = self.applied.get(motor)
+            if applied is None or not same_settings(edited[fields], applied[fields]):
+                self.message.set(f"Motor {motor} · Aplique os ajustes e aguarde a confirmação para iniciar.")
+                return False
+        return True
+
+    def receive(self, line):
+        if line.startswith(b"@,"):
+            sample = MotorSample.parse(line.split(b",")[1:])
+            if sample is not None:
+                self.record(sample)
+            return
+        fields = line.decode("ascii", errors="replace").split(",")
+        if line in LEGACY_HELLOS:
+            self.connected = True
+            self.compatible = self.ready = False
+            self.message.set("Firmware anterior detectado. Grave o UF2 atualizado para liberar o acionamento.")
+            self.set_buttons()
+        elif line == PROTOCOL_HELLO:
+            self.connected = True
+            self.compatible = True
+            self.ready = False
+            self.retry_at = monotonic() + 2
+            self.configured.clear()
+            self.pending.clear()
+            self.applied.clear()
+            self.message.set("Sincronizando parâmetros com o Pico")
+            self.set_buttons()
+        elif fields[0] == "!SCALE" and len(fields) == 2:
+            try:
+                resolution = number(fields[1])
+            except ValueError:
+                return
+            if resolution > 0:
+                self.set_scale(resolution)
+        elif fields[0] == "!CFG" and len(fields) == 12 and self.compatible:
+            try:
+                motor = int(fields[1])
+                values = tuple(map(float, fields[2:]))
+            except ValueError:
+                return
+            if motor in MOTORS and not settings_errors(values):
+                self.confirm_settings(motor, values)
+        elif fields[0] == "!ERR" and len(fields) in (3, 4):
+            command, reason = fields[1:3]
+            if command == "PING":
+                self.reset()
+                return
+            if command == "CFG":
+                if len(fields) == 4 and fields[3] in ("1", "3"):
+                    self.pending.pop(int(fields[3]), None)
+                else:
+                    self.pending.clear()
+            self.message.set(f"{command} · {ERRORS.get(reason, reason.replace('_', ' '))}")
+        elif fields[0] == "!OK" and len(fields) == 2:
+            if fields[1] == "STOP":
+                self.pending.clear()
+                if self.compatible and not self.ready:
+                    self.send("HELLO")
+            self.message.set(f"Confirmado pelo Pico · {fields[1]}")
+
+    def confirm_settings(self, motor, values):
+        pending = self.pending.pop(motor, None)
+        if self.ready and pending is None:
+            return
+        if pending is None and not same_settings(values, self.settings[motor]):
+            self.pending[motor] = self.settings[motor]
+            self.send(cfg_command(motor, self.settings[motor]))
+            return
+        if pending is not None and not same_settings(values, pending):
+            self.message.set(f"Parâmetros do motor {motor} diferem dos enviados.")
+            return
+        self.applied[motor] = values
+        self.panels[motor].describe_applied_gain(values, self.resolution)
+        self.configured.add(motor)
+        if self.ready:
+            self.message.set(f"Motor {motor} · Parâmetros aplicados ao Pico.")
+        else:
+            self.panels[motor].set_values(values)
+        if not self.ready and self.configured == set(MOTORS):
+            self.ready = True
+            self.set_buttons()
+            self.message.set(self.warning or "Acionamento conectado")
+
+    def save_motor(self, motor):
+        if not self.ready or motor in self.pending:
+            self.message.set(f"Motor {motor} · Aguarde a confirmação do Pico.")
+            return
+        try:
+            values = self.panels[motor].values()
+            if not same_settings(values, self.applied[motor]):
+                self.message.set(f"Motor {motor} · Aplique os valores antes de salvar.")
+                return
+            settings = {**self.settings, motor: self.applied[motor]}
+            save_settings(settings)
+        except (ValueError, TclError, OSError) as error:
+            self.message.set(f"Motor {motor} · Falha ao salvar ({error}).")
+            return
+        self.settings = settings
+        self.warning = ""
+        self.message.set(f"Motor {motor} · Parâmetros salvos no arquivo.")
+
+    def record(self, sample):
+        motor = sample.motor
+        stream = self.samples[motor]
+        if stream and sample.timestamp < stream[-1].timestamp:
+            stream.clear()
+            self.steps[motor].clear()
+        stream.append(sample)
+        step = self.steps[motor]
+        if sample.mode == 4:
+            if step and step[0].step != sample.step:
+                step.clear()
+            if not step and sample.elapsed > 0:
+                initial = sample.goal - 1
+                step.append(sample._replace(elapsed=0, angle=initial, reference=initial))
+            step.append(sample)
+            self.step_result[motor] = "Em andamento"
+        elif step and self.step_result[motor] == "Em andamento":
+            if sample.mode == 0 and not sample.fault and step[-1].elapsed >= 5.90:
+                self.step_result[motor] = "Concluído"
+            else:
+                self.step_result[motor] = "Interrompido"
+
+    def draw(self):
+        plot_mode = self.plot_mode.get()
+        show_step = plot_mode == "Degrau +1°"
+        show_pwm = plot_mode == "PWM ao vivo"
+        for motor, axis in self.axes.items():
+            stream = self.samples[motor]
+            if stream:
+                self.panels[motor].update(stream[-1])
+            step = self.steps[motor]
+            result = self.step_result[motor]
+            if step:
+                metrics = step_metrics(step, result == "Concluído", self.resolution)
+                self.metrics[motor].set(f"M{motor} · {result} · {metrics}")
+            rows = step if show_step else stream
+            times = [row.elapsed for row in rows] if show_step else (
+                [(row.timestamp - stream[-1].timestamp) * 1e-6 for row in rows] if stream else [])
+            if show_pwm != self.showing_pwm:
+                for trace in self.traces[motor]:
+                    trace.set_visible(not show_pwm)
+                self.pwm_traces[motor].set_visible(show_pwm)
+                axis.set_ylabel("PWM (%)" if show_pwm else "Posição (°)")
+                axis.legend(handles=[self.pwm_traces[motor]] if show_pwm else self.traces[motor], fontsize=8)
+            if show_pwm:
+                self.pwm_traces[motor].set_data(times, [row.pwm for row in rows])
+            else:
+                for trace, field in zip(self.traces[motor], ("goal", "reference", "angle")):
+                    trace.set_data(times, [getattr(row, field) for row in rows])
+            axis.set_xlim((0, 6) if show_step else (-10, 0))
+            axis.relim(visible_only=True)
+            axis.autoscale_view(scalex=False)
+        self.showing_pwm = show_pwm
+        self.canvas.draw_idle()

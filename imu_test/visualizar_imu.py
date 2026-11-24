@@ -1,4 +1,4 @@
-"""Visualiza a telemetria da IMU, dos encoders e dos fins de curso do Pico."""
+"""Exibe a telemetria do Pico e abre a interface de acionamento."""
 
 from collections import deque
 from math import cos, isfinite, nan, radians, sin
@@ -13,6 +13,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import serial
 from serial.tools import list_ports
+from controle_motores import MotorTab, SerialSession
 
 
 HISTORY_SECONDS = 10
@@ -27,9 +28,9 @@ IMU_MESSAGES = (
     "IMU indisponível. Verifique alimentação, SDA e SCL.",
 )
 TRAVEL_MESSAGES = (
-    "Em calibração: acione os dois fins de curso",
-    "Mínimo registrado. Acione o máximo.",
-    "Máximo registrado. Acione o mínimo.",
+    "Curso pendente. Use a aba Acionamento.",
+    "Mínimo registrado. Buscando o máximo.",
+    "Máximo registrado.",
     "Curso calibrado",
 )
 
@@ -252,8 +253,10 @@ def visualize():
     tabs.pack(fill="both", expand=True)
     imu_tab = ttk.Frame(tabs)
     motors_tab = ttk.Frame(tabs, padding=16)
+    drive_tab = ttk.Frame(tabs, padding=8)
     tabs.add(imu_tab, text="IMU")
     tabs.add(motors_tab, text="Encoders e fins de curso")
+    tabs.add(drive_tab, text="Acionamento")
     motor_panels = [MotorPanel(motors_tab, motor) for motor in (1, 3)]
     for column, panel in enumerate(motor_panels):
         motors_tab.columnconfigure(column, weight=1, uniform="motors")
@@ -289,20 +292,22 @@ def visualize():
     ]
 
     history = deque(maxlen=2000)
-    port = None
-    lines = SerialLines()
+    session = None
+    drive = MotorTab(drive_tab, lambda command: session.send(command) if session else None)
+    window.bind("<Escape>", lambda _event: session.send("STOP") if session else None)
     last_sample_at = None
     last_packet_at = None
     latest_imu = None
     message = "Aguardando dados"
-    timer = canvas.new_timer(interval=40)
+    next_draw = 0.0
+    timer = canvas.new_timer(interval=15)
 
     def reset_stream():
-        nonlocal lines, last_sample_at, last_packet_at, latest_imu, message
+        nonlocal last_sample_at, last_packet_at, latest_imu, message, next_draw
         history.clear()
         motor_history.clear()
-        motor_plots.update(motor_history, monotonic())
-        lines = SerialLines()
+        drive.reset()
+        next_draw = 0
         last_sample_at = None
         last_packet_at = None
         latest_imu = None
@@ -317,24 +322,23 @@ def visualize():
         orientation.set_title("Orientação da IMU")
 
     def connect(device):
-        nonlocal port
-        if port is not None and port.port == device:
+        nonlocal session
+        if session is not None and session.device == device:
             return
         try:
-            new_port = serial.Serial(device, baudrate=115200, timeout=0)
+            new_port = serial.Serial(device, baudrate=115200, timeout=.01, write_timeout=.15)
         except OSError as error:
             details = f"Erro ao abrir {device}: {error}"
-            if port is not None:
-                details += f"\nA leitura continua em {port.port}."
+            if session is not None:
+                details += f"\nA leitura continua em {session.device}."
             messagebox.showerror("Porta serial", details, parent=window)
             return
 
-        if port is not None:
-            port.close()
-        port = new_port
+        if session is not None:
+            session.close()
+        session = SerialSession(new_port, SerialLines())
         reset_stream()
-        status.set(f"{port.port} — {message}")
-        canvas.draw_idle()
+        status.set(f"{session.device} — {message}")
 
     def show_ports():
         port_menu.delete(0, "end")
@@ -346,7 +350,7 @@ def visualize():
         if not available:
             port_menu.add_command(label="Nenhuma porta disponível", state="disabled")
         for entry in available:
-            active = port is not None and port.port == entry.device
+            active = session is not None and session.device == entry.device
             label = f"{entry.device} — {entry.description}"
             port_menu.add_command(
                 label=f"{label} (conectada)" if active else label,
@@ -363,44 +367,49 @@ def visualize():
     port_button.configure(command=show_ports)
 
     def refresh():
-        nonlocal port, last_sample_at, last_packet_at, latest_imu, message
-        if port is None:
+        nonlocal session, last_sample_at, last_packet_at, latest_imu, message, next_draw
+        if session is None:
+            return
+        now = monotonic()
+        session.ui_at = now
+        if session.error is not None:
+            device = session.device
+            error = session.error
+            session.close()
+            session = None
+            reset_stream()
+            status.set(f"Conexão com {device} interrompida ({error}).")
+            redraw_selected_tab(None)
             return
         samples = []
         motor_samples = []
         latest = None
-        try:
-            for line in lines.feed(port.read(min(port.in_waiting, 16384))):
-                if line.startswith(b"#"):
+        for _ in range(min(len(session.incoming), 512)):
+            line = session.incoming.popleft()
+            if line.startswith((b"@", b"!")):
+                drive.receive(line)
+            elif line.startswith(b"#"):
+                history.clear()
+                last_sample_at = None
+                latest_imu = None
+                message = line[1:].strip().decode("utf-8", errors="replace")
+                samples.clear()
+            else:
+                packet = parse_sample(line)
+                if packet is None:
+                    continue
+                latest = packet
+                if packet.motors is not None:
+                    motor_samples.append(packet.motors)
+                if packet.imu is None:
                     history.clear()
                     last_sample_at = None
                     latest_imu = None
-                    message = line[1:].strip().decode("utf-8", errors="replace")
                     samples.clear()
                 else:
-                    packet = parse_sample(line)
-                    if packet is None:
-                        continue
-                    latest = packet
-                    if packet.motors is not None:
-                        motor_samples.append(packet.motors)
-                    if packet.imu is None:
-                        history.clear()
-                        last_sample_at = None
-                        latest_imu = None
-                        samples.clear()
-                    else:
-                        samples.append(packet.imu)
-        except OSError:
-            device = port.port
-            port.close()
-            port = None
-            reset_stream()
-            status.set(f"Conexão com {device} interrompida. Selecione uma porta para reconectar.")
-            canvas.draw_idle()
-            return
+                    samples.append(packet.imu)
+        drive.check_sync(now)
 
-        now = monotonic()
         if motor_samples:
             previous = motor_history[-1][0] if motor_history else None
             times = batch_times(len(motor_samples), now, LOG_PERIOD, previous)
@@ -410,10 +419,10 @@ def visualize():
         if latest is not None:
             last_packet_at = now
             message = IMU_MESSAGES[latest.imu_state]
-            if latest.motors is not None:
+            if latest.motors is not None and tabs.select() == str(motors_tab):
                 for index, (panel, reading) in enumerate(zip(motor_panels, latest.motors)):
                     panel.update(reading, latest.limits[2 * index:2 * index + 2])
-            else:
+            elif latest.motors is None:
                 for panel in motor_panels:
                     panel.update(None, (None, None))
                 message += " | Firmware com telemetria somente da IMU"
@@ -432,6 +441,20 @@ def visualize():
 
         while history and history[0][0] < now - HISTORY_SECONDS:
             history.popleft()
+        status.set(f"{session.device} — {message}")
+        if now >= next_draw:
+            next_draw = now + .12
+            redraw_selected_tab(None)
+
+    def redraw_selected_tab(_event):
+        now = monotonic()
+        selected = tabs.select()
+        if selected == str(drive_tab):
+            drive.draw()
+            return
+        if selected == str(motors_tab):
+            motor_plots.update(motor_history, now)
+            return
         if history:
             values = np.asarray(history)
             for column, trace in enumerate(traces, start=1):
@@ -457,17 +480,7 @@ def visualize():
         else:
             orientation.set_title("Orientação da IMU")
 
-        status.set(f"{port.port} — {message}")
-        if tabs.select() == str(imu_tab):
-            canvas.draw_idle()
-        else:
-            motor_plots.update(motor_history, now)
-
-    def redraw_selected_tab(_event):
-        if tabs.select() == str(motors_tab):
-            motor_plots.update(motor_history, monotonic())
-        else:
-            canvas.draw_idle()
+        canvas.draw_idle()
 
     tabs.bind("<<NotebookTabChanged>>", redraw_selected_tab)
     timer.add_callback(refresh)
@@ -477,8 +490,8 @@ def visualize():
         window.mainloop()
     finally:
         timer.stop()
-        if port is not None:
-            port.close()
+        if session is not None:
+            session.close()
 
 
 if __name__ == "__main__":

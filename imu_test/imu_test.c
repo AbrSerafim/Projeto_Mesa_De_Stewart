@@ -8,27 +8,24 @@
 #include "encoder_channel.pio.h"
 #include "quadrature_encoder.pio.h"
 #include "hardware/i2c.h"
+#include "hardware/watchdog.h"
 #include "pico/critical_section.h"
 #include "pico/stdlib.h"
+#include "pico/stdio_usb.h"
+#include "motor_control.h"
 
 #define IMU_I2C i2c0
 #define IMU_SDA 4
 #define IMU_SCL 5
 #define I2C_BAUD 100000u
 #define I2C_TIMEOUT_US 5000u
-#define ENCODER_PERIOD_MS 10u
 #define ENCODER_SPEED_WINDOW_MS 200u
 #define IMU_PERIOD_MS 20u
-#define LIMIT_PERIOD_MS 30u
 #define LOG_PERIOD_MS 40u
 #define CALIBRATION_SAMPLES (2000u / IMU_PERIOD_MS)
 
 #define CORE_0 (1u << 0)
 #define CORE_1 (1u << 1)
-// Quadrature counts per revolution of the motor shaft, before the gearbox.
-#define ENCODER_COUNTS_PER_MOTOR_REV 64.0f
-// Provisional correction for reported encoder angle and speed.
-#define ENCODER_ANGULAR_SCALE 0.1f
 
 #define DEG_TO_RAD 0.01745329252f
 #define RAD_TO_DEG 57.29577951f
@@ -66,7 +63,6 @@ typedef enum {
 
 typedef struct {
     uint pin_a, pin_b;
-    float counts_per_rev;
     int sign;
     uint quadrature_sm, channel_a_sm, channel_b_sm;
 } Encoder;
@@ -82,29 +78,16 @@ typedef struct {
     uint64_t time_us;
 } EncoderSpeedSample;
 
-enum { MOTOR_1, MOTOR_3, MOTOR_COUNT };
-enum { LIMIT_MIN = 1u, LIMIT_MAX = 2u, LIMIT_BOTH = LIMIT_MIN | LIMIT_MAX };
-
-typedef struct {
-    int64_t min_count;
-    int64_t max_count;
-    unsigned captured;
-} TravelCalibration;
-
 static Encoder encoders[MOTOR_COUNT] = {
-    [MOTOR_1] = {.pin_a = 8, .pin_b = 9, .counts_per_rev = ENCODER_COUNTS_PER_MOTOR_REV, .sign = 1},
-    [MOTOR_3] = {.pin_a = 6, .pin_b = 7, .counts_per_rev = ENCODER_COUNTS_PER_MOTOR_REV, .sign = 1},
+    [MOTOR_1] = {.pin_a = 8, .pin_b = 9, .sign = 1},
+    [MOTOR_3] = {.pin_a = 6, .pin_b = 7, .sign = 1},
 };
-
-static const uint limit_pins[] = {10, 11, 12, 13}; // M1 min/max, then M3 min/max
 
 typedef struct {
     EncoderReading motor[MOTOR_COUNT];
-    TravelCalibration travel[MOTOR_COUNT];
     Sample imu;
     Vec3 angles;
     ImuState imu_state;
-    unsigned limits;
 } Telemetry;
 
 static Telemetry telemetry;
@@ -169,16 +152,16 @@ static void encoder_task(void *parameter)
         reading.count += delta;
         reading.pulses_a += previous_a - channel_a;
         reading.pulses_b += previous_b - channel_b;
-        reading.angle_deg = (float)reading.count * encoder->sign * 360.0f
-            * ENCODER_ANGULAR_SCALE / encoder->counts_per_rev;
+        reading.angle_deg = (float)reading.count * encoder->sign * ENCODER_DEGREES_PER_COUNT;
 
-        // Use a rolling window for speed while publishing position every 10 ms.
+        motor_encoder_sample(motor, reading.count, now_us);
+        // Use a rolling window for display speed while publishing position every 5 ms.
         const EncoderSpeedSample old = speed_history[speed_slot].time_us != 0
             ? speed_history[speed_slot] : initial;
         const uint64_t elapsed_us = now_us - old.time_us;
         reading.rpm = elapsed_us > 0
-            ? (float)(reading.count - old.count) * encoder->sign * 60000000.0f * ENCODER_ANGULAR_SCALE
-                / (encoder->counts_per_rev * (float)elapsed_us)
+            ? (float)(reading.count - old.count) * encoder->sign * 60000000.0f
+                / (ENCODER_COUNTS_PER_OUTPUT_REV * (float)elapsed_us)
             : 0.0f;
         speed_history[speed_slot] = (EncoderSpeedSample){reading.count, now_us};
         speed_slot = (speed_slot + 1) % count_of(speed_history);
@@ -192,63 +175,11 @@ static void encoder_task(void *parameter)
     }
 }
 
-static unsigned read_limits(void)
-{
-    const uint32_t levels = gpio_get_all();
-    unsigned pressed = 0;
-    for (uint i = 0; i < count_of(limit_pins); ++i) {
-        pressed |= ((~levels >> limit_pins[i]) & 1u) << i;
-    }
-    return pressed;
-}
-
-static void capture_limit(TravelCalibration *travel, unsigned limit, int64_t count)
-{
-    if (travel->captured == LIMIT_BOTH) {
-        return;
-    }
-    if (limit == LIMIT_MIN && (!(travel->captured & LIMIT_MAX) || count != travel->max_count)) {
-        travel->min_count = count;
-        travel->captured |= LIMIT_MIN;
-    } else if (limit == LIMIT_MAX && (!(travel->captured & LIMIT_MIN) || count != travel->min_count)) {
-        travel->max_count = count;
-        travel->captured |= LIMIT_MAX;
-    }
-}
-
 static float travel_percent(const TravelCalibration *travel, int64_t count)
 {
     const float percent = 100.0f * (float)(count - travel->min_count)
         / (float)(travel->max_count - travel->min_count);
     return fminf(100.0f, fmaxf(0.0f, percent));
-}
-
-static void limit_task(void *parameter)
-{
-    (void)parameter;
-    unsigned previous_raw = 0;
-    unsigned stable = 0;
-    TickType_t wake = xTaskGetTickCount();
-    for (;;) {
-        const unsigned raw = read_limits();
-        // Accept a change after two consecutive samples agree.
-        const unsigned changed = (raw ^ stable) & ~(raw ^ previous_raw);
-        stable ^= changed;
-        previous_raw = raw;
-
-        critical_section_enter_blocking(&telemetry_lock);
-        telemetry.limits = stable;
-        for (uint motor = 0; motor < MOTOR_COUNT; ++motor) {
-            const uint shift = motor * 2;
-            const unsigned pressed = (stable >> shift) & LIMIT_BOTH;
-            if ((pressed == LIMIT_MIN || pressed == LIMIT_MAX)
-                && ((changed >> shift) & pressed)) {
-                capture_limit(&telemetry.travel[motor], pressed, telemetry.motor[motor].count);
-            }
-        }
-        critical_section_exit(&telemetry_lock);
-        xTaskDelayUntil(&wake, pdMS_TO_TICKS(LIMIT_PERIOD_MS));
-    }
 }
 
 static bool write_register(uint8_t address, uint8_t reg, uint8_t value)
@@ -485,74 +416,120 @@ static void imu_task(void *parameter)
     }
 }
 
-static void logging_task(void *parameter)
+static void log_telemetry(void)
+{
+    critical_section_enter_blocking(&telemetry_lock);
+    const Telemetry snapshot = telemetry;
+    critical_section_exit(&telemetry_lock);
+
+    char imu_csv[112] = ",,,,,,,,";
+    if (snapshot.imu_state == IMU_READY) {
+        const Sample s = snapshot.imu;
+        const Vec3 a = snapshot.angles;
+        snprintf(imu_csv, sizeof imu_csv, "%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f",
+                 s.accel.x, s.accel.y, s.accel.z, s.gyro.x, s.gyro.y, s.gyro.z, a.x, a.y, a.z);
+    }
+    const EncoderReading m1 = snapshot.motor[MOTOR_1];
+    const EncoderReading m3 = snapshot.motor[MOTOR_3];
+    const unsigned limits = motor_limits();
+    TravelCalibration travel[MOTOR_COUNT];
+    char travel_csv[MOTOR_COUNT][12] = {{0}};
+    for (uint motor = 0; motor < MOTOR_COUNT; ++motor) {
+        travel[motor] = motor_travel(motor);
+        if (travel[motor].captured == LIMIT_BOTH) {
+            snprintf(travel_csv[motor], sizeof travel_csv[motor], "%.2f",
+                     travel_percent(&travel[motor], snapshot.motor[motor].count));
+        }
+    }
+    printf("%s,%" PRId64 ",%" PRIu64 ",%" PRIu64 ",%.4f,%.3f,"
+           "%" PRId64 ",%" PRIu64 ",%" PRIu64 ",%.4f,%.3f,%u,%u,%u,%u,%u,%u,%s,%u,%s\n",
+           imu_csv, m1.count, m1.pulses_a, m1.pulses_b, m1.angle_deg, m1.rpm,
+           m3.count, m3.pulses_a, m3.pulses_b, m3.angle_deg, m3.rpm,
+           limits & 1u, (limits >> 1) & 1u,
+           (limits >> 2) & 1u, (limits >> 3) & 1u,
+           (unsigned)snapshot.imu_state,
+           travel[MOTOR_1].captured, travel_csv[MOTOR_1],
+           travel[MOTOR_3].captured, travel_csv[MOTOR_3]);
+}
+
+static void communication_task(void *parameter)
 {
     (void)parameter;
-    puts("accelx,accely,accelz,gyrox,gyroy,gyroz,angx,angy,angz,"
-         "m1_count,m1_pulses_a,m1_pulses_b,m1_angle_deg,m1_rpm,"
-         "m3_count,m3_pulses_a,m3_pulses_b,m3_angle_deg,m3_rpm,"
-         "m1_min,m1_max,m3_min,m3_max,imu_state,"
-         "m1_limits_captured,m1_travel_pct,m3_limits_captured,m3_travel_pct");
-
+    char line[192];
+    size_t length = 0;
+    bool discard = false;
+    bool connected = false;
+    uint64_t last_log = 0;
     TickType_t wake = xTaskGetTickCount();
     for (;;) {
-        xTaskDelayUntil(&wake, pdMS_TO_TICKS(LOG_PERIOD_MS));
-        critical_section_enter_blocking(&telemetry_lock);
-        const Telemetry snapshot = telemetry;
-        critical_section_exit(&telemetry_lock);
-
-        char imu_csv[112] = ",,,,,,,,";
-        if (snapshot.imu_state == IMU_READY) {
-            const Sample s = snapshot.imu;
-            const Vec3 a = snapshot.angles;
-            snprintf(imu_csv, sizeof imu_csv, "%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f",
-                     s.accel.x, s.accel.y, s.accel.z, s.gyro.x, s.gyro.y, s.gyro.z, a.x, a.y, a.z);
+        xTaskDelayUntil(&wake, pdMS_TO_TICKS(2));
+        if (!stdio_usb_connected()) {
+            if (connected) {
+                motor_link_down();
+            }
+            connected = false;
+            length = 0;
+            discard = false;
+            continue;
         }
-        const EncoderReading m1 = snapshot.motor[MOTOR_1];
-        const EncoderReading m3 = snapshot.motor[MOTOR_3];
-        char travel_csv[MOTOR_COUNT][12] = {{0}};
-        for (uint motor = 0; motor < MOTOR_COUNT; ++motor) {
-            const TravelCalibration *travel = &snapshot.travel[motor];
-            if (travel->captured == LIMIT_BOTH) {
-                snprintf(travel_csv[motor], sizeof travel_csv[motor], "%.2f",
-                         travel_percent(travel, snapshot.motor[motor].count));
+        if (!connected) {
+            connected = true;
+            puts("accelx,accely,accelz,gyrox,gyroy,gyroz,angx,angy,angz,"
+                 "m1_count,m1_pulses_a,m1_pulses_b,m1_angle_deg,m1_rpm,"
+                 "m3_count,m3_pulses_a,m3_pulses_b,m3_angle_deg,m3_rpm,"
+                 "m1_min,m1_max,m3_min,m3_max,imu_state,"
+                 "m1_limits_captured,m1_travel_pct,m3_limits_captured,m3_travel_pct");
+        }
+        for (unsigned n = 0; n < 256; ++n) {
+            const int c = getchar_timeout_us(0);
+            if (c < 0) {
+                break;
+            }
+            if (c == '\n') {
+                if (!discard && length != 0) {
+                    line[length] = '\0';
+                    motor_command(line);
+                }
+                length = 0;
+                discard = false;
+            } else if (c != '\r' && !discard) {
+                if (length == sizeof line - 1 || c < 32 || c > 126) {
+                    discard = true;
+                } else {
+                    line[length++] = (char)c;
+                }
             }
         }
-        printf("%s,%" PRId64 ",%" PRIu64 ",%" PRIu64 ",%.4f,%.3f,"
-               "%" PRId64 ",%" PRIu64 ",%" PRIu64 ",%.4f,%.3f,%u,%u,%u,%u,%u,%u,%s,%u,%s\n",
-               imu_csv, m1.count, m1.pulses_a, m1.pulses_b, m1.angle_deg, m1.rpm,
-               m3.count, m3.pulses_a, m3.pulses_b, m3.angle_deg, m3.rpm,
-               snapshot.limits & 1u, (snapshot.limits >> 1) & 1u,
-               (snapshot.limits >> 2) & 1u, (snapshot.limits >> 3) & 1u,
-               (unsigned)snapshot.imu_state,
-               snapshot.travel[MOTOR_1].captured, travel_csv[MOTOR_1],
-               snapshot.travel[MOTOR_3].captured, travel_csv[MOTOR_3]);
+        motor_send_updates();
+        const uint64_t now = time_us_64();
+        if (now - last_log >= LOG_PERIOD_MS * 1000u) {
+            last_log = now;
+            log_telemetry();
+        }
     }
 }
 
 int main(void)
 {
+    motors_init();
     stdio_init_all();
     critical_section_init(&telemetry_lock);
     init_encoders();
-    for (uint i = 0; i < count_of(limit_pins); ++i) {
-        gpio_init(limit_pins[i]);
-        gpio_set_dir(limit_pins[i], GPIO_IN);
-        gpio_pull_up(limit_pins[i]);
-    }
     i2c_init(IMU_I2C, I2C_BAUD);
     gpio_set_function(IMU_SDA, GPIO_FUNC_I2C);
     gpio_set_function(IMU_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(IMU_SDA);
     gpio_pull_up(IMU_SCL);
 
-    if (xTaskCreateAffinitySet(encoder_task, "encoder_m1", 384, &encoders[MOTOR_1], 3, CORE_0, NULL) != pdPASS
-        || xTaskCreateAffinitySet(encoder_task, "encoder_m3", 384, &encoders[MOTOR_3], 3, CORE_0, NULL) != pdPASS
+    if (xTaskCreateAffinitySet(encoder_task, "encoder_m1", 384, &encoders[MOTOR_1], 5, CORE_0, NULL) != pdPASS
+        || xTaskCreateAffinitySet(encoder_task, "encoder_m3", 384, &encoders[MOTOR_3], 5, CORE_0, NULL) != pdPASS
+        || xTaskCreateAffinitySet(motor_task, "motor_m1", 512, (void *)(uintptr_t)MOTOR_1, 4, CORE_0, NULL) != pdPASS
+        || xTaskCreateAffinitySet(motor_task, "motor_m3", 512, (void *)(uintptr_t)MOTOR_3, 4, CORE_0, NULL) != pdPASS
         || xTaskCreateAffinitySet(imu_task, "imu", 512, NULL, 2, CORE_0, NULL) != pdPASS
-        || xTaskCreateAffinitySet(limit_task, "limits", 256, NULL, 1, CORE_0, NULL) != pdPASS
-        || xTaskCreateAffinitySet(logging_task, "usb_log", 1024, NULL, 1, CORE_1, NULL) != pdPASS) {
+        || xTaskCreateAffinitySet(communication_task, "usb_serial", 1024, NULL, 2, CORE_1, NULL) != pdPASS) {
         panic("Could not allocate FreeRTOS tasks");
     }
+    watchdog_enable(1000, true);
     vTaskStartScheduler();
     panic("FreeRTOS scheduler stopped");
 }

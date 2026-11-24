@@ -1,0 +1,4 @@
+# PIDF externo em graus, saida em graus/s. PI interno gera PWM.
+# Motor Kp Ki Kd Tf Vmax Amax Vcal_rapida Vcal_lenta PWMmax Polaridade
+1 400 20 10 0.105 171.15 1026.29 171.15 147.51 57.93 1
+3 400 20 10 0.105 182.74 955.36 182.74 139.43 97.09 1

@@ -39,7 +39,7 @@ add_subdirectory(FreeRTOS_Kernel/portable/ThirdParty/GCC/RP2040)
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(imu_test imu_test.c )
+add_executable(imu_test imu_test.c motor_control.c)
 
 pico_set_program_name(imu_test "imu_test")
 pico_set_program_version(imu_test "0.1")
@@ -50,7 +50,8 @@ pico_enable_stdio_usb(imu_test 1)
 
 # Limit the time spent waiting for USB transmission during sampling.
 target_compile_definitions(imu_test PRIVATE PICO_STDIO_USB_STDOUT_TIMEOUT_US=2000)
-target_link_libraries(imu_test PRIVATE pico_stdlib hardware_i2c hardware_pio FreeRTOS-Kernel-Heap4 m)
+target_link_libraries(imu_test PRIVATE pico_stdlib hardware_i2c hardware_pio hardware_pwm
+                       hardware_watchdog FreeRTOS-Kernel-Heap4 m)
 pico_generate_pio_header(imu_test ${CMAKE_CURRENT_LIST_DIR}/quadrature_encoder.pio)
 pico_generate_pio_header(imu_test ${CMAKE_CURRENT_LIST_DIR}/encoder_channel.pio)
 
