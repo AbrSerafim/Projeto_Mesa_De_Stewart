@@ -26,16 +26,18 @@
 #define STALL_AT_LIMIT_US 750000u
 #define STEP_DURATION_US 6000000u
 #define PWM_TOP 6249u
-#define ENABLE_PWM_HZ 2000u
+#define ENABLE_PWM_HZ 20000u
 #define PWM_RISE_PER_TICK (25.0f * ENCODER_PERIOD_MS / 1000.0f)
 #define REVERSAL_US 30000u
 #define CAL_PAUSE_US 80000u
 #define SPEED_GUARD_WINDOW_US 150000u
 #define SPEED_PI_HOLD_US 100000u
 #define SPEED_CONTROL_SAMPLES (50u / ENCODER_PERIOD_MS)
-// Bench PI gains converted from rpm to degrees per second.
+// The speed PI takes an error in degrees/second and outputs duty in percent.
 #define SPEED_PI_KP 0.20f
-#define SPEED_PI_KI 0.15f
+#define SPEED_PI_KI 0.30f
+// Approximate inverse slope of the M1/M3 bench data, in % PWM per degree/second.
+#define SPEED_FEEDFORWARD 0.035f
 #define FRICTION_DUTY_PERCENT 13.0f
 #define FRICTION_BLEND_SPEED 1.0f
 #define POSITION_CAPTURE_DEG ENCODER_DEGREES_PER_COUNT
@@ -59,6 +61,9 @@
 #define BALL_TRAVEL_MAX 99.0f
 #define BALL_TIMEOUT_US 450000u
 #define BALL_SWITCH_CONFIRM_US 25000u
+#define BALL_START_ASSIST_DELAY_US 60000u
+#define BALL_START_ASSIST_RATE 110.0f
+#define BALL_MEASURED_START_ASSIST_RATE 160.0f
 #define PWM_TEST_TIMEOUT_US 350000u
 #define PWM_TEST_MARGIN_DEG 2.0f
 #define PWM_TEST_RISE_PER_TICK (5.0f * ENCODER_PERIOD_MS / 1000.0f)
@@ -524,10 +529,15 @@ static bool overspeed(Motor *m, float max_speed)
 
 static float startup_step(const Motor *m, uint64_t now, int direction, float effort, float dt)
 {
-    if (now - m->encoder_motion_at < START_ASSIST_DELAY_US) {
+    const bool balancing = ball_running();
+    const uint64_t delay = balancing ? BALL_START_ASSIST_DELAY_US : START_ASSIST_DELAY_US;
+    if (now - m->encoder_motion_at < delay) {
         return 0;
     }
     const float measured = direction > 0 ? m->breakaway_forward : m->breakaway_reverse;
+    if (balancing) {
+        return (effort < measured ? BALL_MEASURED_START_ASSIST_RATE : BALL_START_ASSIST_RATE) * dt;
+    }
     const float rate = effort < measured ? MEASURED_START_ASSIST_RATE : START_ASSIST_RATE;
     return rate * dt;
 }
@@ -643,6 +653,8 @@ static bool capturing_position(Motor *m, uint64_t now)
         return false;
     }
     const float error = m->goal - m->position;
+    const bool ball_neutral = ball_running() && fabsf(m->goal - HOME_TRAVEL_FRACTION * m->span) < .0001f;
+    const float capture_distance = ball_neutral ? POSITION_RELEASE_DEG : POSITION_CAPTURE_DEG;
     const bool crossed = error * m->previous_goal_error < 0;
     m->previous_goal_error = error;
     if (m->capture_at != 0) {
@@ -654,7 +666,7 @@ static bool capturing_position(Motor *m, uint64_t now)
         m->previous_angle = m->position;
         return false;
     }
-    if (!crossed && fabsf(error) > POSITION_CAPTURE_DEG) {
+    if (!crossed && fabsf(error) > capture_distance) {
         return false;
     }
     m->capture_at = now;
@@ -694,7 +706,8 @@ static float speed_pi(Motor *m, uint64_t now, bool control_sample, float target,
     const float error = speed - direction * measured;
     const float max_duty = duty_limit(m);
     const float friction = fminf(FRICTION_DUTY_PERCENT, max_duty * .60f);
-    const float feedforward = friction * fminf(1, speed / FRICTION_BLEND_SPEED);
+    const float feedforward = fminf(max_duty * .60f,
+        friction * fminf(1, speed / FRICTION_BLEND_SPEED) + SPEED_FEEDFORWARD * speed);
     const float base = feedforward + SPEED_PI_KP * error;
     const float step = SPEED_PI_KI * dt * error;
     // Add starting torque to the integral, so it remains available after the first encoder edges.

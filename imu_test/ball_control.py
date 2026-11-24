@@ -2,7 +2,7 @@
 
 import json
 from collections import deque
-from math import ceil, floor, isfinite
+from math import ceil, copysign, floor, isfinite
 from pathlib import Path
 from time import monotonic
 import tkinter as tk
@@ -18,6 +18,8 @@ HOME_PERCENT = 40.0
 MAX_AGE = .32
 SEND_PERIOD = .05
 COURSE_WINDOW = 8
+MIN_CORRECTION_START_PX = 3
+MIN_CORRECTION_FULL_PX = 8
 
 
 class AxisConfig(NamedTuple):
@@ -30,7 +32,8 @@ class AxisConfig(NamedTuple):
     invert: bool = False
     course_min: float = 35
     course_max: float = 45
-    pwm_max: float = 30
+    pwm_max: float = 45
+    correction_min: float = 1.2
 
     def gains(self):
         return self.kp, self.ki if self.mode != "P" else 0, self.kd if self.mode in ("PID", "PIDF") else 0
@@ -43,6 +46,8 @@ class AxisConfig(NamedTuple):
             raise ValueError("Use curso mínimo ≥ 1%, máximo ≤ 99% e deixe 40% dentro da faixa.")
         if not .1 <= self.pwm_max <= 100:
             raise ValueError("Use PWM máx. de 0,1% a 100%.")
+        if not 0 <= self.correction_min <= 59:
+            raise ValueError("Use correção mínima de 0 a 59 pontos percentuais.")
         if self.mode == "PIDF" and self.kd > 0 and self.tf < .001:
             raise ValueError("Tf deve ser de pelo menos 0,001 s no PIDF com Kd ativo.")
         return self
@@ -79,6 +84,10 @@ class AxisController:
         if not ((candidate > high and step > 0) or (candidate < low and step < 0)):
             self.integral = min(high, max(low, self.integral + step))
         correction = base + self.integral
+        if correction * error > 0:
+            ratio = min(1, max(0, (abs(error) - MIN_CORRECTION_START_PX)
+                               / (MIN_CORRECTION_FULL_PX - MIN_CORRECTION_START_PX)))
+            correction = copysign(max(abs(correction), cfg.correction_min * ratio), correction)
         self.limited = correction <= low or correction >= high
         return HOME_PERCENT + min(high, max(low, correction))
 
@@ -160,16 +169,17 @@ class AxisPanel:
         ttk.Label(self.frame, text="Modo").grid(row=0, column=0, sticky="w")
         ttk.Combobox(self.frame, textvariable=self.mode, values=LAWS, state="readonly",
                      width=7).grid(row=0, column=1, sticky="ew")
-        labels = ("Kp", "Ki", "Kd", "Tf (s)", "Correção ± p.p.", "Curso mín. %", "Curso máx. %", "PWM máx. %")
+        labels = ("Kp", "Ki", "Kd", "Tf (s)", "Correção ± p.p.", "Curso mín. %", "Curso máx. %", "PWM máx. %",
+                  "Correção mín. p.p.")
         for row, (label, value) in enumerate(zip(labels, (*config[1:6], *config[7:])), start=1):
             var = tk.StringVar(value=f"{value:g}")
             self.fields.append(var)
             ttk.Label(self.frame, text=label).grid(row=row, column=0, sticky="w", pady=2, padx=(0, 4))
             ttk.Entry(self.frame, textvariable=var, width=8).grid(row=row, column=1, sticky="ew")
-        ttk.Checkbutton(self.frame, text="Inverter sentido", variable=self.invert).grid(row=9, columnspan=2, sticky="w")
+        ttk.Checkbutton(self.frame, text="Inverter sentido", variable=self.invert).grid(row=10, columnspan=2, sticky="w")
         self.status = tk.StringVar()
-        ttk.Label(self.frame, text="Erro em px · saída em % do curso").grid(row=10, columnspan=2, sticky="w", pady=(7, 0))
-        ttk.Label(self.frame, textvariable=self.status).grid(row=11, columnspan=2, sticky="w")
+        ttk.Label(self.frame, text="Erro em px · saída em % do curso").grid(row=11, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Label(self.frame, textvariable=self.status).grid(row=12, columnspan=2, sticky="w")
         self.frame.pack(fill="x")
         self.plot = CoursePlot(parent)
 
