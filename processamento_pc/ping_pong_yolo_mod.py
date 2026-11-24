@@ -43,7 +43,7 @@ def capture_img() -> cv2.typing.MatLike:
         raise RuntimeError("Not able to capture camera frame")
     return frame
 
-def inference(frame: cv2.typing.MatLike,conf: float = CONF): return model(frame,conf=conf,verbose=False)
+def inference(frame: cv2.typing.MatLike,conf: float = CONF): return model(frame,imgsz=640,conf=conf,verbose=False)
 
 def extract_result(results):
     # Check if anything was found

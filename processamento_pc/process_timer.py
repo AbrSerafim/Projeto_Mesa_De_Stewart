@@ -1,6 +1,7 @@
 """ Code to a process time """
 
 from Timer import PipelineTimer
+from pathlib import Path
 import cv2
 
 import ping_pong_yolo_mod as ppy
@@ -10,10 +11,12 @@ timer = PipelineTimer()
 
 MODE = "yolo" # "yolo" || "opencv"
 
+MODEL_PATH = Path("yolo26n.pt")
+
 CAMERA_ID = 0
 
 if MODE == "yolo":
-    ppy.setup(camera_id=CAMERA_ID)
+    ppy.setup(model_path=MODEL_PATH, camera_id=CAMERA_ID)
 
     while True:
 
@@ -24,6 +27,7 @@ if MODE == "yolo":
         # 2. Inference
         with timer.measure("Inference"):
             results = ppy.inference(frame)
+            #print(results[0].orig_shape)
 
         # 3. Bbox process
         with timer.measure("Bbox process"):
@@ -32,6 +36,7 @@ if MODE == "yolo":
         # 4. Process results
         with timer.measure("Process results"):
             box = ppy.process_result(bbox)
+            print(box)
 
         # 5. Draw results
         with timer.measure("Drawing"):

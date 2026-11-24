@@ -7,7 +7,7 @@ from ultralytics import YOLO
 # CONFIGURATION
 # ============================================================
 
-MODEL_PATH = Path("yolo26n.engine")  # Path to your trained YOLO model
+MODEL_PATH = Path("yolo26n.pt")  # Path to your trained YOLO model
 IMAGE_SIZE = 640              # Input image size: 640x640
 DEVICE = 0                    # First NVIDIA GPU
 HALF = True                   # Use FP16 for TensorRT

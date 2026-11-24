@@ -1,13 +1,11 @@
 """ Motor table model """
 
-import sympy as sp
 import numpy as np
-
 from math import pi
 
 class Motor_table_model():
     """ Class to handle the motor to table model params """
-    def __init__(self, lengths: list[float], ang: float,  theta_0: float = pi, theta_1: float = 0.0) -> None:
+    def __init__(self, lengths: list[float], ang: float,  theta_0: float = pi, theta_1: float = 0.0, test: bool = False) -> None:
 
         if len(lengths) != 6:
             raise ValueError("Expected 6 linkage lengths")
@@ -16,6 +14,8 @@ class Motor_table_model():
 
         if self.l2 == 0:
             raise ValueError("L2 cannot be zero")
+
+        self.test_mode = test
 
         self.ang = ang # Fixed angle between motor and pivot
 
@@ -54,8 +54,11 @@ class Motor_table_model():
             +2*self.l*self.l4*self.sin*np.cos(self.theta_0) + 2*self.l*self.l5*self.sin*np.sin(self.theta_0)
         )
 
-    def solve_theta_1(self, tol: float=1e-9) -> list[float]:
+    def solve_theta_1(self, tol: float=1e-9) -> float:
         """ Solve inverse kinematics for valid theta values """
+
+        #if self.test_mode:
+        #    return self.theta_1
 
         d = self.Q**2 + self.P**2 - self.R**2
 
@@ -75,14 +78,4 @@ class Motor_table_model():
 
 
 if __name__ == "__main__":
-    u, b, c, f, g, h, d = sp.symbols('u b c f g h d')
-
-    expr = b*((1-u**2)/(1+u**2))**2 + c*((2*u)/(1+u**2))**2
-    expr += f*((1-u**2)/(1+u**2)) + g*((2*u)/(1+u**2)) + h*((1-u**2)/(1+u**2))*((2*u)/(1+u**2)) + d
-
-    expr = sp.expand(expr)
-    expr = sp.simplify(expr)
-
-    print(expr)
-
-    #expr = sp.simplify(expr) * (u**4 + 2*u**2 + 1)
+    pass

@@ -3,13 +3,13 @@
 import serial
 import time
 
-class com():
+class Com():
     """ Class to handle the communication """
-    def __init__(self) -> None:
+    def __init__(self, port="COM5", baudrate=115200, timeout=1) -> None:
         self.ser = serial.Serial(
-            port="COM5",
-            baudrate=115200,
-            timeout=1
+            port=port,
+            baudrate=baudrate,
+            timeout=timeout
             )
 
         time.sleep(2) # Wait for Pico to initialize
