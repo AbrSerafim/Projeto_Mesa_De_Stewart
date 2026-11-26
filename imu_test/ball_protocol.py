@@ -26,15 +26,17 @@ class BallWindow:
         self.sequence = 0
         self.pending = self.in_flight = None
         self.last_sent = None
+        self.streaming = False
         self.send_period = send_period
         self.ack_timeout = ack_timeout
         self.target_age = target_age
         self.events = deque(maxlen=1024)
 
-    def begin(self, session, now):
+    def begin(self, session, now, streaming=False):
         with self.lock:
             self._clear(now, "session_changed")
             self.session = session
+            self.streaming = streaming
             self.sequence = 0
             self.last_sent = None
 
@@ -79,9 +81,11 @@ class BallWindow:
                 self.events.append(BallEvent(now, self.session, sequence, "expired", *values))
                 return None
             self.last_sent = now
-            self.in_flight = (now, sequence, values)
+            if not self.streaming:
+                self.in_flight = (now, sequence, values)
             self.events.append(BallEvent(now, self.session, sequence, "sent", *values))
-            return f"BALL2 {self.session} {sequence} {values[0]:.4f} {values[1]:.4f}"
+            command = "BALLFAST" if self.streaming else "BALL2"
+            return f"{command} {self.session} {sequence} {values[0]:.4f} {values[1]:.4f}"
 
     def receive(self, line, now):
         fields = line.split(b",")
@@ -115,6 +119,9 @@ class BallWindow:
                     mutex_us = None
             except (ValueError, UnicodeError):
                 self.events.append(BallEvent(now, 0, 0, "invalid_reply", 0, 0))
+                return
+            if self.streaming and kind == b"!BALLNACK" and session == self.session and 0 < sequence <= self.sequence:
+                self.events.append(BallEvent(now, session, sequence, outcome, float("nan"), float("nan")))
                 return
             active = self.in_flight
             if active is None or session != self.session or sequence != active[1]:

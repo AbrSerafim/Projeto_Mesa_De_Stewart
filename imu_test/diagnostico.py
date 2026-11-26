@@ -9,7 +9,7 @@ from secrets import randbelow
 import sys
 from time import monotonic, sleep
 
-from ball_control import SEND_PERIOD, BallControl, BallRegulator
+from ball_control import SEND_PERIOD, BallControl, BallRegulator, tracking_configs
 from controle_motores import PROTOCOL_HELLO, MotorSample, SerialSession
 from visualizar_imu import SerialLines
 
@@ -39,7 +39,7 @@ def serial_diagnostic(args):
     try:
         hello = await_item(connection, connection.incoming, lambda item: item[1] == PROTOCOL_HELLO, 3)
         if hello is None:
-            raise OSError("Handshake v13 ausente")
+            raise OSError("Handshake v14 ausente")
         identifier = randbelow(2**32 - 1) + 1
         connection.send(f"TELEM {args.telemetry_hz}")
         connection.send(f"BALLTEST2 {identifier}")
@@ -86,7 +86,7 @@ def ball_diagnostic(args):
     configs, geometry, _, warning = BallControl.load()
     if warning:
         raise ValueError(warning)
-    controller = BallRegulator(configs, geometry)
+    controller = BallRegulator(tracking_configs(configs), geometry)
     rows = [(index * .05, 320 - index * 10, 240 + index * 4) for index in range(11)]
     if args.input:
         with open(args.input, encoding="utf-8", newline="") as input_file:

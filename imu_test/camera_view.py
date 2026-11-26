@@ -475,9 +475,8 @@ class CameraView:
         left, top, right, bottom = self.preview_bounds
         if not (left <= event.x < right and top <= event.y < bottom):
             return
-        self.ball.stop("Autocorreção parada · setpoint alterado")
         self.setpoint = ((event.x - left) / (right - left), (event.y - top) / (bottom - top))
-        self.ball.setpoint = self.setpoint
+        self.ball.set_target(self.setpoint)
         self.setpoint_status.set(f"Setpoint na imagem · X {self.setpoint[0]:.1%} · Y {self.setpoint[1]:.1%}")
         self.clear_button.configure(state="normal")
         self.draw_setpoint()
@@ -653,7 +652,7 @@ class CameraView:
                 self.canvas.delete("disparity")
             self.ball.camera_fps = capture.fps
             self.ball.yolo_fps = self.detector.fps if detector_ok else 0.0
-            self.ball.update_preview(result, self.setpoint)
+            self.ball.update_preview(result)
         elif self.submitted is not None:
             self.clear_detection()
             self.rendered = None

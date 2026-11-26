@@ -114,7 +114,7 @@ static void test_framing(void)
 
 static void test_protocol_and_safety(void)
 {
-    command("HELLO", "!HELLO,13");
+    command("HELLO", "!HELLO,14");
     command("BALLLINK2 2468", "!BALLLINK2,2468");
     command("BALLTEST2 4294967297 2468", "!BALLSTARTERR,0,argumento_invalido");
     command("BALLTEST2 4000000001 2468", "!BALLSTATE2,4000000001,5");
@@ -132,14 +132,14 @@ static void test_protocol_and_safety(void)
     command("BALL2 4000000001 4000000004 39 43", "!BALLNACK,4000000001,4000000004,sessao_inativa");
     command("BALLTEST2 4000000001 2468", "!BALLSTARTERR,4000000001,sessao_ocupada");
 
-    command("HELLO", "!HELLO,13");
+    command("HELLO", "!HELLO,14");
     command("BALLLINK2 1357", "!BALLLINK2,1357");
     command("BALLTEST2 4000000002 2468", "!BALLSTARTERR,4000000002,sem_sessao");
     for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
         Motor *m = &motors[i];
         m->span = 100;
         m->travel = (TravelCalibration){.min_count = 0, .max_count = 356, .captured = LIMIT_BOTH};
-        m->position = 40;
+        m->position = i == MOTOR_1 ? 8 : 40;
         m->sampled_at = mock_time;
     }
     command("BALLSTART2 3 1357 10 90 45 40 12 88 45 42", "!BALLSTATE2,3,4");
@@ -159,8 +159,16 @@ static void test_protocol_and_safety(void)
     command("BALL2 3 2 38 46", "!BALLACK,3,2,1,38.0000,46.0000");
     near(motors[MOTOR_1].goal, 38);
     near(motors[MOTOR_3].goal, 46);
+    near(motors[MOTOR_1].reference, 38);
+    near(motors[MOTOR_3].reference, 46);
     assert(!capturing_position(&motors[MOTOR_1], mock_time));
-    command("BALL2 3 3 87 97", "!BALLNACK,3,3,bola_fora_da_faixa");
+    command("BALLFAST 3 3 41 39", "");
+    assert(response[0] == '\0');
+    near(motors[MOTOR_1].reference, 41);
+    near(motors[MOTOR_3].reference, 39);
+    command("BALLFAST 3 2 38 46", "!BALLNACK,3,2,sequencia_antiga");
+    near(motors[MOTOR_1].reference, 41);
+    command("BALLFAST 3 4 87 97", "!BALLNACK,3,4,bola_fora_da_faixa");
     assert(ball_state == BALL_MOTOR && motors[MOTOR_3].fault == BALL_INVALID_TARGET);
     assert(motors[MOTOR_1].mode == BRAKE && motors[MOTOR_3].mode == BRAKE);
 
@@ -169,13 +177,26 @@ static void test_protocol_and_safety(void)
     }
     command("BALLSTART2 4 1357 10 90 45 40 12 88 45 42", "!BALLSTARTERR,4,rearme_necessario");
     command("REARM", "!OK,REARM");
-    command("BALLSTART2 4 1357 10 90 45 40 12 88 45 42", "!BALLSTATE2,4,4");
+    command("BALLSTART2 4 1357 10 90 45 40 12 88 45 42", "!BALLSTATE2,4,1");
+    Motor *m = &motors[MOTOR_1];
+    m->cfg.speed = 318.29f;
+    m->cfg.acceleration = 1851.69f;
+    m->count = 140;
+    m->guard_at = mock_time - SPEED_GUARD_WINDOW_US;
+    m->guard_count = m->count - 21;
+    m->guard_excess = true;
+    m->sampled_at = mock_time;
+    m->control_velocity = 39.9f;
+    update_motor(MOTOR_1, mock_time, true, true);
+    assert(ball_state == BALL_ACTIVE && m->fault == NO_FAULT && m->bridge == BRIDGE_BRAKE);
+    near(speed_limit(m), TRACKING_MAX_SPEED);
+    near(acceleration_limit(m), TRACKING_MAX_ACCELERATION);
     mock_time += BALL_TIMEOUT_US;
     update_motor(MOTOR_1, mock_time, true, true);
     assert(ball_state == BALL_TIMEOUT && motors[MOTOR_1].mode == BRAKE);
     motor_link_down();
     assert(!linked && motors[MOTOR_3].mode == BRAKE);
-    command("HELLO", "!HELLO,13");
+    command("HELLO", "!HELLO,14");
     command("BALL2 4 1 38 46", "!BALLNACK,4,1,sessao_inativa");
 }
 

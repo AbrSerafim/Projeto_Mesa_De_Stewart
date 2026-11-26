@@ -24,7 +24,8 @@ HOME_PERCENT = 40.0
 MAX_AGE = .32
 MIN_DT = .001
 MAX_DT = .32
-SEND_PERIOD = .05
+SEND_PERIOD = .05  # Intervalo nominal para reprodução de ensaios com ACK.
+DETECTION_GRACE_S = .12
 START_TIMEOUT = .40
 COURSE_WINDOW = 8
 MIN_CORRECTION_START_PX = 3
@@ -60,6 +61,19 @@ class AxisConfig(NamedTuple):
         if self.mode == "PIDF" and self.kd > 0 and self.tf < .001:
             raise ValueError("Tf deve ser de pelo menos 0,001 s no PIDF com Kd ativo.")
         return self
+
+
+def tracking_profile(config):
+    """Conserva o sentido e os limites físicos usados na bancada."""
+    return config._replace(mode="PIDF", kp=.04, ki=0, kd=.012, tf=.055, limit=5, correction_min=0)
+
+
+def saturated_below_one_pixel(config):
+    return config.kp > config.limit
+
+
+def tracking_configs(configs):
+    return tuple(tracking_profile(cfg) if saturated_below_one_pixel(cfg) else cfg for cfg in configs)
 
 
 def ball_center(boxes):
@@ -163,6 +177,9 @@ class BallRegulator:
         if measurement is None or not all(map(isfinite, (*goal, *measurement))):
             self.reset()
             return None
+        return self.calculate(goal, measurement, dt)
+
+    def calculate(self, goal, measurement, dt=0):
         prepared = [axis.prepare(r, y, dt) for axis, r, y in zip(self.axes, goal, measurement)]
         integrals = [axis.integral for axis in self.axes]
         proposed = [clip(i + step, -axis.config.limit, axis.config.limit)
@@ -205,44 +222,56 @@ class BallTracking(Thread):
         self.failure = None
 
     def run(self):
-        last_capture = last_command = None
-        last_seen = monotonic()
+        last_capture = last_seen = None
+        started_at = monotonic()
+        previous_target = None
         neutral = self.regulator.geometry.neutral
-        while not self.stopped.wait(.005):
-            now = monotonic()
+        loss_timeout = self.regulator.geometry.loss_timeout_s
+        while not self.stopped.wait(.003):
             result = self.source()
+            now = monotonic()
+            running = self.running.is_set()
+            setpoint = self.setpoint
+            target = (running, setpoint)
             fresh = result is not None and 0 <= now - result.captured_at <= MAX_AGE
-            if fresh and (last_capture is None or result.captured_at > last_capture):
-                center = ball_center(result.boxes)
-                if center is not None:
-                    last_seen = result.captured_at
-            missing = fresh and not result.boxes and self.regulator.geometry.loss_behavior == "stop_on_missing"
-            if missing or now - last_seen > self.regulator.geometry.loss_timeout_s:
-                self.failure = "Autocorreção parada · tempo sem detecção da bola excedido"
+            new_frame = fresh and (last_capture is None or result.captured_at > last_capture)
+            retarget = running and previous_target != target and fresh
+            center = ball_center(result.boxes) if new_frame or retarget else None
+            if new_frame:
+                last_capture = result.captured_at
+            if center is not None:
+                last_seen = result.captured_at
+            missing = (running and new_frame and center is None
+                       and self.regulator.geometry.loss_behavior == "stop_on_missing")
+            stale_camera = now - (started_at if last_capture is None else last_capture) > loss_timeout
+            lost_ball = running and last_seen is not None and now - last_seen > loss_timeout
+            if missing or stale_camera or lost_ball:
+                self.failure = ("Autocorreção parada · detector sem quadros recentes" if stale_camera else
+                                "Autocorreção parada · tempo sem detecção da bola excedido")
                 if not self.stopped.is_set():
                     self.send(f"BALLSTOP {self.session}")
                 return
-            if not fresh or (last_capture is not None and result.captured_at <= last_capture):
+            if not new_frame and not retarget:
                 continue
-            if last_command is not None and now - last_command < SEND_PERIOD:
-                if self.running.is_set() and center is None:
-                    self.regulator.reset()
-                continue
-            last_command = now
-            last_capture = result.captured_at
+            previous_target = target
             targets, terms = neutral, ()
-            if self.running.is_set():
+            if running and center is None:
+                if last_seen is not None and result.captured_at - last_seen <= min(DETECTION_GRACE_S, loss_timeout):
+                    continue
+                self.regulator.reset()
+            elif running:
                 height, width = result.frame.shape[:2]
-                goal = self.setpoint[0] * width, self.setpoint[1] * height
-                measured = None if center is None else (center[0] * width, center[1] * height)
-                calculated = self.regulator.update(last_capture, goal, measured)
-                if calculated is not None:
-                    targets, terms = calculated
+                goal = setpoint[0] * width, setpoint[1] * height
+                measured = center[0] * width, center[1] * height
+                if self.regulator.last_at == result.captured_at:
+                    targets, terms = self.regulator.calculate(goal, measured)
+                else:
+                    targets, terms = self.regulator.update(result.captured_at, goal, measured)
             end = monotonic()
             if self.stopped.is_set():
                 return
             sequence = self.send(f"TARGET {self.session} {targets[0]:.4f} {targets[1]:.4f}")
-            self.samples.append((last_capture, end, sequence, targets, terms, result.duration_ms, end - now))
+            self.samples.append((result.captured_at, end, sequence, targets, terms, result.duration_ms, end - now))
 
 
 class CoursePlot:
@@ -252,7 +281,7 @@ class CoursePlot:
         self.canvas = tk.Canvas(frame, width=202, height=176, bg="white", highlightthickness=0)
         self.canvas.pack(fill="x")
         self.calculated = deque(maxlen=256)
-        self.accepted = deque(maxlen=256)
+        self.sent = deque(maxlen=256)
         self.measured = deque(maxlen=512)
         self.reference = deque(maxlen=512)
         self.changed = True
@@ -273,7 +302,7 @@ class CoursePlot:
 
     @property
     def series(self):
-        return self.calculated, self.accepted, self.reference, self.measured
+        return self.calculated, self.sent, self.reference, self.measured
 
     def draw(self):
         self.changed = False
@@ -297,7 +326,7 @@ class CoursePlot:
         canvas.create_text(right, bottom + 12, anchor="e", text="0 s", fill="#384550")
         for series, color, label, legend_x, legend_y, steps in (
             (self.calculated, "#155ec0", "Calculado", 7, 143, True),
-            (self.accepted, "#7642a8", "Confirmado", 103, 143, True),
+            (self.sent, "#7642a8", "Enviado", 103, 143, True),
             (self.reference, "#a65d05", "Ref. interna", 7, 160, False),
             (self.measured, "#00734a", "Encoder", 103, 160, False),
         ):
@@ -344,6 +373,12 @@ class AxisPanel:
         self.frame.pack(fill="x")
         self.plot = CoursePlot(parent, motor)
 
+    def set_values(self, config):
+        self.mode.set(config.mode)
+        self.invert.set(config.invert)
+        for field, value in zip(self.fields, (*config[1:6], *config[7:])):
+            field.set(f"{value:g}")
+
     def values(self):
         values = [float(var.get().replace(",", ".")) for var in self.fields]
         return AxisConfig(self.mode.get(), *values[:5], self.invert.get(), *values[5:]).validate()
@@ -353,6 +388,9 @@ class BallControl:
     def __init__(self, left, right, toolbar, confidence):
         self.confidence = confidence
         self.config, self.geometry, saved_confidence, warning = self.load()
+        if any(saturated_below_one_pixel(cfg) for cfg in self.config):
+            self.config = tracking_configs(self.config)
+            warning = "Ganhos salvos saturavam abaixo de 1 px. Perfil de rastreamento carregado em memória."
         self.confidence.set(saved_confidence * 100)
         self.panels = (AxisPanel(left, "Bola X · limites M3", self.config[0], 3),
                        AxisPanel(right, "Bola Y · limites M1", self.config[1], 1))
@@ -382,6 +420,7 @@ class BallControl:
         self.apply_button.pack(side="left", padx=(0, 5))
         self.save_button = ttk.Button(toolbar, text="Salvar PID da bola", command=self.save)
         self.save_button.pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar, text="Perfil de rastreamento", command=self.use_tracking_profile).pack(side="left", padx=(0, 5))
         ttk.Button(toolbar, text="Usar nivelamento", command=self.use_level_neutral).pack(side="left", padx=(0, 5))
         ttk.Button(toolbar, text="Rearmar", command=self.rearm).pack(side="left", padx=(0, 5))
         ttk.Button(toolbar, text="Curvas PID", command=self.show_terms).pack(side="left", padx=(0, 5))
@@ -430,12 +469,29 @@ class BallControl:
         try:
             configs = tuple(panel.values() for panel in self.panels)
             self.geometry.validate(configs)
+            if any(saturated_below_one_pixel(cfg) for cfg in configs):
+                raise ValueError("reduza Kp: o termo P atinge o limite antes de 1 px")
             self.config = configs
         except (ValueError, tk.TclError) as error:
             self.status.set(f"Parâmetros da bola inválidos ({error}).")
             return False
         self.status.set("Ajustes aplicados")
         return True
+
+    def use_tracking_profile(self):
+        if self.state != "idle":
+            self.status.set("Pare a autocorreção para aplicar o perfil de rastreamento.")
+            return
+        try:
+            configs = tuple(tracking_profile(panel.values()) for panel in self.panels)
+            self.geometry.validate(configs)
+        except (ValueError, tk.TclError) as error:
+            self.status.set(f"Confira os limites e parâmetros ({error}).")
+            return
+        for panel, config in zip(self.panels, configs):
+            panel.set_values(config)
+        self.config = configs
+        self.status.set("Perfil de rastreamento carregado em memória.")
 
     def save(self):
         if not self.apply():
@@ -610,9 +666,9 @@ class BallControl:
         self.events.append(event)
         key = event.outcome.split(":", 1)[0]
         self.counts[key] = self.counts.get(key, 0) + 1
-        if event.outcome == "applied":
+        if event.outcome == "sent":
             for panel, value in zip(self.panels, (event.m3, event.m1)):
-                panel.plot.add(panel.plot.accepted, event.at, value)
+                panel.plot.add(panel.plot.sent, event.at, value)
 
     def record_reference(self, at, sample):
         if self.state in ("centering", "running") and sample.mode == 3 and sample.calibrated == 3 and sample.span > 0:
@@ -655,12 +711,8 @@ class BallControl:
             self.term_draw_at = now + .25
         recent = [event for event in self.events if now - event.at <= 2]
         tx = sum(event.outcome == "sent" for event in recent) / 2
-        rx = sum(event.rtt_s is not None for event in recent) / 2
-        last_ack = next((event for event in reversed(self.events) if event.outcome == "applied"), None)
-        rates = f"Câmera {self.camera_fps:.1f} FPS · YOLO {self.yolo_fps:.1f} FPS · TX {tx:.1f} Hz · ACK {rx:.1f} Hz"
-        if last_ack:
-            rates += f" · ACK #{last_ack.sequence} · RTT {last_ack.rtt_s * 1000:.1f} ms"
-        rates += (f" · timeout {self.counts.get('timeout', 0)} · substituídos {self.counts.get('replaced', 0)}"
+        rates = f"Câmera {self.camera_fps:.1f} FPS · YOLO {self.yolo_fps:.1f} FPS · TX {tx:.1f} Hz"
+        rates += (f" · substituídos {self.counts.get('replaced', 0)}"
                   f" · rejeitados {self.counts.get('nack', 0)} · expirados {self.counts.get('expired', 0)}"
                   f" · inválidos {self.counts.get('invalid_reply', 0)}")
         if self.latest_control and self.state != "idle":
@@ -669,7 +721,7 @@ class BallControl:
             rates += (f"\nControle {control_hz:.1f} Hz · idade {1000 * (now - captured):.0f} ms"
                       f" · inferência {infer:.1f} ms · geração {generation * 1000:.2f} ms")
         self.diagnostics.set(rates)
-        self.button.after(100, self.refresh_diagnostics)
+        self.button.after(50, self.refresh_diagnostics)
 
     def receive_fault(self, line):
         try:
@@ -728,10 +780,10 @@ class BallControl:
                 self.status.set("Centralizando nos neutros M1/M3")
                 self.worker.start()
             elif state == 1 and self.state in ("pending", "centering"):
+                self.worker.running.set()
                 if self.state == "pending":
                     self.worker.start()
                 self.state = "running"
-                self.worker.running.set()
                 self.status.set("Autocorreção ativa")
             elif state in (0, 2, 3):
                 reason = {0: "Autocorreção parada no Pico", 2: "Pico parou por falta de comandos",
@@ -739,6 +791,10 @@ class BallControl:
                 self.stop(reason, send=False)
         self.refresh_button()
 
-    def update_preview(self, result, setpoint):
+    def set_target(self, setpoint):
         self.setpoint = setpoint
-        self.frame_at = result.captured_at if result is not None and ball_center(result.boxes) else None
+        if self.worker is not None:
+            self.worker.setpoint = setpoint
+
+    def update_preview(self, result):
+        self.frame_at = result.captured_at if result is not None else None

@@ -142,14 +142,20 @@ class PicoMock:
                     raise ValueError
             except (ValueError, IndexError):
                 return
-            self.session, self.state, self.sequence = session, 5 if command == "BALLTEST2" else 4, 0
+            self.session, self.sequence = session, 0
+            if command == "BALLTEST2":
+                self.state = 5
+            elif limits[0] <= self.encoder[0] <= limits[1] and limits[4] <= self.encoder[1] <= limits[5]:
+                self.state = 1
+                self.goal[:] = self.encoder
+            else:
+                self.state = 4
+                self.goal[:] = limits[3], limits[7]
             self.last_target = monotonic()
             self.centered_at = self.last_target + .25
-            if self.state == 4:
-                self.goal[:] = limits[3], limits[7]
             self.inject(f"!BALLSTATE2,{session},{self.state}".encode())
-        elif command == "BALL2":
-            self.target(args)
+        elif command in ("BALL2", "BALLFAST"):
+            self.target(args, acknowledge=command == "BALL2")
         elif command == "PING" and not self.hello:
             self.inject(b"!ERR,PING,sem_sessao")
 
@@ -159,7 +165,7 @@ class PicoMock:
             raise ValueError
         return int(value)
 
-    def target(self, args):
+    def target(self, args, acknowledge=True):
         session = sequence = 0
         reason = None
         try:
@@ -185,5 +191,5 @@ class PicoMock:
         if self.state == 1:
             self.targets = m1, m3
             self.goal[:] = self.targets
-        if sequence not in self.drop:
+        if acknowledge and sequence not in self.drop:
             self.inject(f"!BALLACK,{session},{sequence},{self.state},{m1:.4f},{m3:.4f},0".encode())

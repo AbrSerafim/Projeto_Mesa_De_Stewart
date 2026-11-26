@@ -13,7 +13,6 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import serial
 from serial.tools import list_ports
-from ball_control import SEND_PERIOD
 from camera_view import CameraView
 from controle_motores import LEGACY_HELLOS, LOCAL_GRAVITY, PROTOCOL_HELLO, MotorTab, SerialSession
 
@@ -371,7 +370,7 @@ def visualize(mock=False):
                 from pico_mock import PicoMock
                 new_port = PicoMock(telemetry=True)
             else:
-                new_port = serial.Serial(device, baudrate=115200, timeout=.01, write_timeout=.15)
+                new_port = serial.Serial(device, baudrate=115200, timeout=.003, write_timeout=.15)
         except OSError as error:
             details = f"Erro ao abrir {device}: {error}"
             if session is not None:
@@ -382,7 +381,7 @@ def visualize(mock=False):
         if session is not None:
             session.close()
         session = SerialSession(new_port, SerialLines(), ack_timeout=camera.ball.geometry.ack_timeout_s,
-                                ball_period=SEND_PERIOD)
+                                live_ball=True)
         reset_stream()
         camera.ball.connected(monotonic())
         status.set(f"{session.device} — {message}")

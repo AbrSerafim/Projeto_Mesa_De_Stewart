@@ -5,12 +5,13 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from ball_control import AxisConfig, BallControl, BallGeometry, BallRegulator, BallTracking
+from ball_control import (AxisConfig, BallGeometry, BallRegulator, BallTracking,
+                          saturated_below_one_pixel, tracking_profile)
 from ball_protocol import BallWindow
 from controle_motores import MotorSample, SerialSession, step_metrics
 from pico_mock import PicoMock
 from visualizar_imu import SerialLines
-from yolo_detection import Detection
+from yolo_detection import CUSTOM_WEIGHTS, CameraDetector, Detection, DetectionResult
 
 
 def wait_for(predicate, timeout=1):
@@ -77,14 +78,16 @@ class BallEquationTests(unittest.TestCase):
         self.assertEqual((terms[0].i, terms[1].i), (0, 0))
         self.assertLess(r.update(.2, (-1, -1), (0, 0))[0][0], 40)
 
-    def test_conservative_profile_and_motor_order(self):
-        configs, geometry, _, warning = BallControl.load()
-        self.assertFalse(warning)
-        self.assertEqual(configs[0].kp, .02)
-        r = BallRegulator(configs, geometry)
+    def test_tracking_profile_and_motor_order(self):
+        old = AxisConfig(kp=100, limit=20, invert=True, course_min=10, course_max=90, pwm_max=90)
+        self.assertTrue(saturated_below_one_pixel(old))
+        config = tracking_profile(old)
+        self.assertEqual((config.invert, config.course_min, config.course_max, config.pwm_max),
+                         (True, 10, 90, 90))
+        r = BallRegulator((config, config), BallGeometry())
         targets, _ = r.update(0, (10, -20), (0, 0))
-        self.assertAlmostEqual(targets[0], 40.4)
-        self.assertAlmostEqual(targets[1], 39.8)
+        self.assertAlmostEqual(targets[0], 40.8)
+        self.assertAlmostEqual(targets[1], 39.6)
         self.assertEqual(BallGeometry(((2, -1), (0, 1)), (41, 38)).mix((1, .25)), (42.75, 38.25))
 
     def test_config_validation_and_optional_minimum(self):
@@ -125,7 +128,83 @@ class BallEquationTests(unittest.TestCase):
             worker.join(.5)
 
 
+    def test_derivative_brakes_ball_approaching_then_crossing_target(self):
+        cfg = tracking_profile(AxisConfig())
+        regulator = BallRegulator((cfg, cfg), BallGeometry())
+        regulator.update(1, (320, 240), (300, 240))
+        targets, terms = regulator.update(1.075, (320, 240), (316, 240))
+        self.assertGreater(terms[0].p, 0)
+        self.assertLess(terms[0].d, -terms[0].p)
+        self.assertLess(targets[1], 40)
+        crossed, _ = regulator.update(1.15, (320, 240), (331, 240))
+        self.assertLess(crossed[1], 40)
+
+    def test_worker_waits_at_neutral_and_retargets_same_frame(self):
+        cfg = tracking_profile(AxisConfig())
+        regulator = BallRegulator((cfg, cfg), BallGeometry())
+        frame = SimpleNamespace(shape=(480, 640, 3))
+        sample = SimpleNamespace(frame=frame, captured_at=time.monotonic(), duration_ms=2, boxes=())
+        current = [sample]
+        commands = []
+        worker = BallTracking(lambda: current[0], (.5, .5), regulator, 8, commands.append)
+        worker.running.set()
+        worker.start()
+        try:
+            self.assertTrue(wait_for(lambda: len(commands) >= 1, .2))
+            self.assertEqual(commands[0], "TARGET 8 40.0000 40.0000")
+            current[0] = SimpleNamespace(frame=frame, captured_at=time.monotonic(), duration_ms=2,
+                                         boxes=(Detection((.28, .47, .32, .53), .9),))
+            self.assertTrue(wait_for(lambda: len(commands) >= 2, .2))
+            captured_at = regulator.last_at
+            derivative = regulator.axes[0].derivative
+            worker.setpoint = (.25, .5)
+            self.assertTrue(wait_for(lambda: len(commands) >= 3, .2))
+            self.assertGreater(float(commands[1].split()[3]), 40)
+            self.assertLess(float(commands[2].split()[3]), 40)
+            self.assertEqual(regulator.last_at, captured_at)
+            self.assertEqual(regulator.axes[0].derivative, derivative)
+        finally:
+            worker.stopped.set()
+            worker.join(.5)
+
+
+class DetectionTests(unittest.TestCase):
+    def test_custom_model_uses_full_frame_after_tracking_miss(self):
+        sizes = []
+        model = SimpleNamespace(task="detect", names={0: "bola"})
+        boxes = (Detection((.2, .2, .3, .3), .9),)
+
+        def infer(_model, frame, class_name, _class_id, _confidence, size):
+            sizes.append(size)
+            return DetectionResult(frame, class_name, boxes if len(sizes) != 2 else (), 2)
+
+        with patch("yolo_detection.load_model", return_value=model), patch("yolo_detection.detect", infer):
+            detector = CameraDetector(weights=CUSTOM_WEIGHTS)
+            try:
+                for _ in range(3):
+                    frame = object()
+                    detector.submit(frame, "bola")
+                    self.assertTrue(wait_for(lambda: detector.result is not None and detector.result.frame is frame))
+                self.assertEqual(sizes, [640, 448, 640])
+            finally:
+                detector.close()
+                detector.thread.join(.5)
+
+
 class SerialTests(unittest.TestCase):
+    def test_stream_ignores_ack_window_and_keeps_latest(self):
+        window = BallWindow()
+        window.begin(8, 1, streaming=True)
+        window.offer(8, (40, 41), 1)
+        self.assertEqual(window.next_command(1), "BALLFAST 8 1 40.0000 41.0000")
+        window.offer(8, (42, 40), 1.01)
+        window.offer(8, (43, 40), 1.02)
+        self.assertEqual(window.next_command(1.02), "BALLFAST 8 3 43.0000 40.0000")
+        window.receive(b"!BALLNACK,8,3,bola_fora_da_faixa", 1.03)
+        self.assertEqual(window.events[-1].outcome, "nack:bola_fora_da_faixa")
+        self.assertTrue(window.clear(1.04, "cancelled", 8))
+        self.assertIsNone(window.next_command(1.05))
+
     def test_serial_framing(self):
         framer = SerialLines()
         self.assertEqual(framer.feed(b"!BALLA"), [])
@@ -168,6 +247,25 @@ class SerialTests(unittest.TestCase):
         self.assertEqual(window.events[-1].outcome, "centering")
         window.receive(b"!BALLSTATE2,8,2", .04)
         self.assertEqual(window.session, 0)
+
+    def test_live_serial_applies_commands_without_ack_and_stops(self):
+        pico = PicoMock()
+        connection = SerialSession(pico, SerialLines(), live_ball=True)
+        try:
+            self.assertTrue(wait_for(lambda: pico.link != 0))
+            connection.send("BALLSTART2 7 10 90 45 40 10 90 45 40")
+            self.assertTrue(wait_for(lambda: pico.state == 1))
+            connection.send("TARGET 7 39 41")
+            self.assertTrue(wait_for(lambda: pico.targets == (39, 41), .10))
+            connection.send("TARGET 7 41 39")
+            self.assertTrue(wait_for(lambda: pico.targets == (41, 39), .10))
+            self.assertIsNone(connection.ball.in_flight)
+            self.assertEqual([cmd for cmd in pico.writes if cmd.startswith("BALLFAST ")],
+                             ["BALLFAST 7 1 39.0000 41.0000", "BALLFAST 7 2 41.0000 39.0000"])
+            connection.send("STOP")
+            self.assertTrue(wait_for(lambda: pico.state == 0))
+        finally:
+            connection.close()
 
     def test_worker_missing_ack_stop_reconnect(self):
         pico = PicoMock(drop=(1,), fragment=3)

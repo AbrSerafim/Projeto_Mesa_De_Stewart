@@ -45,9 +45,9 @@ def load_model(weights=None):
     return YOLO(str(cache / "yolo26n.pt"))
 
 
-def detect(model, frame, class_name, class_id, confidence=.20):
+def detect(model, frame, class_name, class_id, confidence=.20, image_size=640):
     start = monotonic()
-    result = model.predict(frame, classes=[class_id], imgsz=640, conf=confidence, save=False, verbose=False)[0]
+    result = model.predict(frame, classes=[class_id], imgsz=image_size, conf=confidence, save=False, verbose=False)[0]
     boxes = result.boxes.cpu()
     detections = tuple(Detection(tuple(bounds), confidence)
                        for bounds, confidence in zip(boxes.xyxyn.tolist(), boxes.conf.tolist()))
@@ -114,6 +114,7 @@ class CameraDetector:
         model = aruco_detector = None
         classes = {}
         previous_at = previous_generation = None
+        detected_generation = None
         while True:
             with self.condition:
                 self.condition.wait_for(lambda: self.closed or self.pending is not None)
@@ -138,7 +139,10 @@ class CameraDetector:
                             self.names = (*EXAMPLE_CLASSES, *sorted(classes.keys() - set(EXAMPLE_CLASSES)))
                         self.loaded = True
                     model_class = self.names[0] if self.weights is not None else class_name
-                    boxes = detect(model, frame, class_name, classes[model_class], confidence).boxes
+                    # Keep full resolution for acquisition and after a tracking miss.
+                    image_size = 448 if self.weights is not None and generation == detected_generation else 640
+                    boxes = detect(model, frame, class_name, classes[model_class], confidence, image_size).boxes
+                    detected_generation = generation if boxes else None
                 except ImportError:
                     self.error = "Instale as dependências de requirements.txt para usar o YOLO."
                 except Exception as error:

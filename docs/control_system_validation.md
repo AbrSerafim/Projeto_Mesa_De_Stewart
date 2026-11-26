@@ -34,7 +34,7 @@ Na bancada, trave a plataforma mecanicamente e mantenha a alimentação de potê
 3. Teste degraus de ±1°, pequenos próximos da resolução e maiores dentro do curso. Teste seno, cosseno, rampa e reversões a partir da aba Acionamento. Compare subida, acomodação, sobressinal, erro final, PWM, velocidade e tempo em BRAKE no CSV de motores. Compare séries com o mesmo curso, alimentação, carga e janela de tempo.
 4. Na identificação de atrito, teste partida por motor e sentido em posições intermediárias do curso. Para sustentação, marque Sustentação, inicie o movimento e reduza o PWM em passos. Mantenha cada nível por pelo menos 300 ms e aguarde o relatório da última magnitude que sustentou movimento. O ensaio exige pelo menos duas contagens no sentido testado por janela. Anote posição inicial, carga, tensão e direção. Salve os limiares somente após comparar repetições.
 5. Reproduza uma série de referências em pares com a CLI de motores. Use alvos dentro do perfil, instantes iniciando em zero e intervalos de 50 a 300 ms. Faça um ensaio simulado antes do ensaio físico. A série termina com STOP. O CSV contém registros de alvo, estado e motor, com seus campos em JSON para preservar os esquemas.
-6. Com câmera e placa conectadas, use o perfil PIDF de teste. Compare o sentido X→M3 e Y→M1 com pequenos deslocamentos e observe as curvas de erro e curso. Registre idade do quadro, taxas e termos. Oculte a bola, remova o setpoint, provoque perda de comunicação em posição segura e confirme as transições e a necessidade de rearme. Identifique a matriz de acoplamento apenas após medir dois eixos independentes.
+6. Com câmera e placa conectadas, use o botão Perfil de rastreamento. Compare o sentido X→M3 e Y→M1 com pequenos deslocamentos e observe as curvas de erro e curso. Registre idade do quadro, taxas e termos. Oculte a bola, remova o setpoint, provoque perda de comunicação em posição segura e confirme as transições e a necessidade de rearme. Identifique a matriz de acoplamento apenas após medir dois eixos independentes.
 
 Exemplo de `serie.csv`:
 
@@ -53,7 +53,7 @@ python -B diagnostico.py motores --port COM4 --autorizar-movimento --input serie
 
 Para investigar o atraso com mais resolução, use `--telemetry-hz 200` no ensaio de motores e compare com a execução a 25 Hz. Os gráficos e logs mantêm os dois relógios com suas unidades próprias.
 
-## Resultados obtidos
+## Resultados obtidos no protocolo v13
 
 | Camada | Validação |
 |---|---|
@@ -63,3 +63,13 @@ Para investigar o atraso com mais resolução, use `--telemetry-hz 200` no ensai
 | Simulação USB | 1.000 de 1.000 comandos confirmados pelo mock, com p95 de RTT de 0,13 ms na execução final e 0,23 ms em uma repetição sob carga do processo de validação. Essa medição de software usa transporte em memória, sem latência física de USB CDC. |
 | Diagnóstico da bola | Com erro X de +10 px e Y de −4 px, a polaridade original produziu M1=40,08% e M3=39,80%. A reprodução simulada de referências dos motores também terminou com sucesso. |
 | Hardware | A enumeração encontrou a Pico na COM4. A placa permaneceu com o firmware que já estava instalado. Sem ensaio físico, ficam pendentes RTT USB, tempos do RTOS sob carga, corrente, polaridade e resolução medidas, qualidade do YOLO com a câmera, aderência ao alvo e estabilidade com bola. |
+
+
+## Atualização v14 de rastreamento
+
+O ensaio anterior relatou RTT de ACK de 2,5 ms na captura do operador, inversão da meta entre 20% e 60% e falha de velocidade a 39,9 °/s contra um limiar de 23,6 °/s. O ganho da captura saturava com 0,2 px. O perfil atualmente salvo no posto de trabalho saturava a 0,05 px. A versão v14 usa formato BALLFAST, referência de posição direta, frenagem transitória pelo envelope de velocidade e PIDF de rastreamento em memória para os eixos com esses ganhos.
+
+Os testes Python incluem mudança de setpoint no mesmo frame, ação antecipatória da derivada, reaparecimento da bola e passagem de referências sem ACK pela sessão serial simulada. O teste C verifica a referência imediata e reproduz 39,9 °/s em rastreamento com freio transitório e sessão ativa. O build RP2040 gera um novo UF2. A taxa efetiva, a partida e a desaceleração dos atuadores sob carga, e a estabilidade da bola pedem medição com a v14 instalada.
+
+
+Nas 41 imagens salvas, redimensionadas a 640×480 e usando `best.pt` e confiança 0,42, a mediana por inferência caiu de 85,1 ms em 640 para 55,5 ms em 448. A execução em 448 manteve 26 das 27 imagens com detecção da execução em 640, com diferença máxima de 3,54 px entre centros coincidentes. A GUI usa 448 após detectar a bola e 640 na aquisição ou após um quadro sem detecção. As imagens não têm anotações de verdade de referência para calcular precisão ou recall.

@@ -20,8 +20,8 @@ from ball_protocol import BallWindow
 
 
 MOTORS = (1, 3)
-PROTOCOL_HELLO = b"!HELLO,13"
-LEGACY_HELLOS = tuple(f"!HELLO,{version}".encode("ascii") for version in range(1, 13))
+PROTOCOL_HELLO = b"!HELLO,14"
+LEGACY_HELLOS = tuple(f"!HELLO,{version}".encode("ascii") for version in range(1, 14))
 FAST_TELEMETRY_HELLOS = (*LEGACY_HELLOS[5:], PROTOCOL_HELLO)
 LOCAL_GRAVITY = 9.78627
 IMU_REFERENCE_PATH = Path(__file__).with_name("referencia_imu.txt")
@@ -178,7 +178,7 @@ def imu_reference_command(values):
 class SerialSession:
     """Mantém RX, TX e heartbeat fora do thread do Tk."""
 
-    def __init__(self, port, framer, ack_timeout=.15, ball_period=0):
+    def __init__(self, port, framer, ack_timeout=.15, ball_period=0, live_ball=False):
         self.port = port
         self.device = port.port
         self.framer = framer
@@ -186,6 +186,7 @@ class SerialSession:
         self.outgoing = Queue()
         self.ball = BallWindow(ack_timeout=ack_timeout, send_period=ball_period)
         self.link = 0
+        self.live_ball = live_ball
         self.stopping = Event()
         self.braking = Event()
         self.ui_at = monotonic()
@@ -202,7 +203,8 @@ class SerialSession:
                 self.braking.set()
         elif command.startswith(("BALLSTART2 ", "BALLTEST2 ")):
             kind, session, *values = command.split()
-            self.ball.begin(int(session), monotonic())
+            self.ball.begin(int(session), monotonic(),
+                            streaming=self.live_ball and kind == "BALLSTART2")
             self.outgoing.put(" ".join((kind, session, str(self.link), *values)))
         elif command.startswith("TARGET "):
             _, session, m1, m3 = command.split()
