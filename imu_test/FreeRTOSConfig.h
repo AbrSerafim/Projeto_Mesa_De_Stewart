@@ -47,10 +47,16 @@
 
 #define configUSE_IDLE_HOOK                          0
 #define configUSE_TICK_HOOK                          0
+#ifdef STEWART_FREERTOS_DIAGNOSTICS
+#define configUSE_MALLOC_FAILED_HOOK                 1
+#define configCHECK_FOR_STACK_OVERFLOW               2
+#else
 #define configUSE_MALLOC_FAILED_HOOK                 0
 #define configCHECK_FOR_STACK_OVERFLOW               0
+#endif
 
 /* APIs necessárias pelas tarefas e pela integração SMP do Pico SDK. */
+#define INCLUDE_uxTaskGetStackHighWaterMark          1
 #define INCLUDE_vTaskDelay                           1
 #define INCLUDE_xTaskDelayUntil                      1
 #define INCLUDE_vTaskSuspend                         1

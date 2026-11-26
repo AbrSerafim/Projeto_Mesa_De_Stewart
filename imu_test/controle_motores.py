@@ -1,22 +1,27 @@
 """Comunicação e interface de acionamento dos motores da mesa."""
 
 from collections import deque
+import csv
 import json
 from math import isclose, isfinite
 from pathlib import Path
 from queue import Empty, Queue
+from secrets import randbelow
 from threading import Event, Thread
 from time import monotonic
 from typing import NamedTuple
-from tkinter import BooleanVar, DoubleVar, StringVar, TclError, messagebox, ttk
+from tkinter import BooleanVar, DoubleVar, StringVar, TclError, filedialog, messagebox, ttk
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 
+from ball_protocol import BallWindow
+
+
 MOTORS = (1, 3)
-PROTOCOL_HELLO = b"!HELLO,12"
-LEGACY_HELLOS = tuple(f"!HELLO,{version}".encode("ascii") for version in range(1, 12))
+PROTOCOL_HELLO = b"!HELLO,13"
+LEGACY_HELLOS = tuple(f"!HELLO,{version}".encode("ascii") for version in range(1, 13))
 FAST_TELEMETRY_HELLOS = (*LEGACY_HELLOS[5:], PROTOCOL_HELLO)
 LOCAL_GRAVITY = 9.78627
 IMU_REFERENCE_PATH = Path(__file__).with_name("referencia_imu.txt")
@@ -173,14 +178,14 @@ def imu_reference_command(values):
 class SerialSession:
     """Mantém RX, TX e heartbeat fora do thread do Tk."""
 
-    def __init__(self, port, framer):
+    def __init__(self, port, framer, ack_timeout=.15, ball_period=0):
         self.port = port
         self.device = port.port
         self.framer = framer
         self.incoming = deque(maxlen=4096)
         self.outgoing = Queue()
-        self.ball_target = deque(maxlen=1)
-        self.ball_sent = deque(maxlen=256)
+        self.ball = BallWindow(ack_timeout=ack_timeout, send_period=ball_period)
+        self.link = 0
         self.stopping = Event()
         self.braking = Event()
         self.ui_at = monotonic()
@@ -190,14 +195,23 @@ class SerialSession:
 
     def send(self, command):
         if command == "STOP":
+            self.ball.clear(monotonic(), "cancelled")
             self.braking.set()
-        elif command.startswith("BALL "):
-            self.ball_target.append((monotonic(), command))
+        elif command.startswith("BALLSTOP "):
+            if self.ball.clear(monotonic(), "cancelled", int(command.split()[1])):
+                self.braking.set()
+        elif command.startswith(("BALLSTART2 ", "BALLTEST2 ")):
+            kind, session, *values = command.split()
+            self.ball.begin(int(session), monotonic())
+            self.outgoing.put(" ".join((kind, session, str(self.link), *values)))
+        elif command.startswith("TARGET "):
+            _, session, m1, m3 = command.split()
+            return self.ball.offer(int(session), (float(m1), float(m3)), monotonic())
         else:
             self.outgoing.put(command)
 
     def discard_commands(self):
-        self.ball_target.clear()
+        self.ball.clear(monotonic(), "cancelled")
         while True:
             try:
                 self.outgoing.get_nowait()
@@ -205,7 +219,9 @@ class SerialSession:
                 return
 
     def write(self, command):
-        self.port.write((command + "\n").encode("ascii"))
+        payload = (("\x18" if command == "STOP" else "") + command + "\n").encode("ascii")
+        if self.port.write(payload) != len(payload):
+            raise OSError("Escrita USB incompleta")
 
     def run(self):
         hello = False
@@ -236,15 +252,9 @@ class SerialSession:
                                 break
                             self.write(command)
                         if not self.braking.is_set():
-                            try:
-                                target_at, target = self.ball_target.popleft()
-                            except IndexError:
-                                pass
-                            else:
-                                if now - target_at <= .12:
-                                    self.write(target)
-                                    _, m1, m3 = target.split()
-                                    self.ball_sent.append((monotonic(), float(m1), float(m3)))
+                            target = self.ball.next_command(monotonic())
+                            if target is not None and not self.braking.is_set():
+                                self.write(target)
                 else:
                     self.discard_commands()
                     if hello and not ui_stopped:
@@ -253,20 +263,27 @@ class SerialSession:
                 chunk = self.port.read(min(self.port.in_waiting or 1, 16384))
                 for line in self.framer.feed(chunk):
                     if line == PROTOCOL_HELLO or line in LEGACY_HELLOS:
+                        if not hello and line == PROTOCOL_HELLO:
+                            self.link = randbelow(2**32 - 1) + 1
+                            self.write(f"BALLLINK2 {self.link}")
                         hello = True
                         next_ping = 0
                     elif line == b"!ERR,PING,sem_sessao":
                         if not hello:
                             continue
                         hello = False
+                        self.link = 0
                         next_hello = 0
                         self.discard_commands()
-                    elif line in (b"!BALL,0", b"!BALL,2", b"!BALL,3"):
-                        self.ball_target.clear()
-                    self.incoming.append(line)
+                    if line.startswith(b"!BALLLINK2,") and line != f"!BALLLINK2,{self.link}".encode("ascii"):
+                        continue
+                    received_at = monotonic()
+                    self.ball.receive(line, received_at)
+                    self.incoming.append((received_at, line))
         except OSError as error:
             self.error = str(error)
         finally:
+            self.ball.clear(monotonic(), "disconnected")
             try:
                 if self.stopping.is_set():
                     self.write("STOP")
@@ -301,18 +318,21 @@ class MotorSample(NamedTuple):
     fault_speed: float = 0
     fault_threshold: float = 0
     speed_setpoint: float = 0
+    step_origin: float | None = None
+    bridge: int | None = None
 
     @classmethod
     def parse(cls, fields):
         try:
-            if len(fields) not in (16, 17, 19, 20):
+            if len(fields) not in (16, 17, 19, 20, 22):
                 return None
             sample = cls(*map(int, fields[:8]), *map(float, fields[8:14]),
                          int(fields[14]), float(fields[15]), *map(int, fields[16:17]),
-                         *map(float, fields[17:]))
+                         *map(float, fields[17:21]), *map(int, fields[21:]))
             if (sample.motor in MOTORS and 0 <= sample.mode < len(MODES)
                     and 0 <= sample.fault < len(FAULTS) and 0 <= sample.phase < len(PHASES)
-                    and sample.enable in (-1, 0, 1)
+                    and sample.enable in (-1, 0, 1) and sample.bridge in (None, 0, 1, 2, 3)
+                    and (sample.step_origin is None or isfinite(sample.step_origin))
                     and all(map(isfinite, (*sample[8:14], sample.elapsed,
                                           sample.fault_speed, sample.fault_threshold, sample.speed_setpoint)))):
                 return sample
@@ -325,21 +345,28 @@ def step_metrics(samples, complete, resolution=ENCODER_RESOLUTION_DEG):
     if len(samples) < 2:
         return "Aguardando amostras"
     target = samples[0].goal
-    initial = target - 1
+    initial = samples[0].step_origin if samples[0].step_origin is not None else target - 1
+    amplitude = target - initial
+    if amplitude == 0:
+        return "Degrau sem deslocamento"
+
+    def progress(sample):
+        return (sample.angle - initial) / amplitude
 
     def crossing(level):
-        if samples[0].angle >= level:
+        if progress(samples[0]) >= level:
             return 0.0
         for before, after in zip(samples, samples[1:]):
-            if before.angle < level <= after.angle:
-                ratio = (level - before.angle) / (after.angle - before.angle)
+            low, high = progress(before), progress(after)
+            if low < level <= high:
+                ratio = (level - low) / (high - low)
                 return before.elapsed + ratio * (after.elapsed - before.elapsed)
         return None
 
-    t10, t90 = crossing(initial + .1), crossing(initial + .9)
+    t10, t90 = crossing(.1), crossing(.9)
     rise = f"{t90 - t10:.2f} s" if t10 is not None and t90 is not None else "—"
-    peak = max(samples, key=lambda row: row.angle)
-    overshoot = 100 * max(0, peak.angle - target)
+    peak = max(samples, key=progress)
+    overshoot = 100 * max(0, progress(peak) - 1)
     tail = [row.angle for row in samples if samples[-1].elapsed - row.elapsed <= .5]
     error = f"{target - sum(tail) / len(tail):+.3f}°" if complete else "—"
     settling = "—"
@@ -411,7 +438,9 @@ class MotorPanel:
         ttk.Combobox(go, width=10, state="readonly", values=("% curso", "° desde mín."),
                      textvariable=self.units).pack(side="left")
         self.button(go, "Mover", lambda: action(self.go), side="left", padx=4)
-        self.button(go, "Degrau +1°", lambda: action(lambda: f"STEP {motor}"), side="right")
+        self.step_degrees = StringVar(value="1")
+        self.button(go, "Degrau em °", lambda: action(self.step), side="right")
+        ttk.Entry(go, width=6, textvariable=self.step_degrees).pack(side="right", padx=4)
 
         wave = ttk.Frame(self.frame)
         wave.pack(fill="x", pady=2)
@@ -431,6 +460,8 @@ class MotorPanel:
         self.pwm_direction_box = ttk.Combobox(row, textvariable=self.pwm_direction, width=15,
             values=("Subir curso (+)", "Descer curso (−)"), state="readonly")
         self.pwm_direction_box.pack(side="left")
+        self.pwm_sustain = BooleanVar()
+        ttk.Checkbutton(row, text="Sustentação", variable=self.pwm_sustain).pack(side="left", padx=3)
         self.pwm_target = DoubleVar()
         self.pwm_label = StringVar(value="0,00%")
         self.pwm_slider = ttk.Scale(row, from_=0, to=100, variable=self.pwm_target, state="disabled",
@@ -488,6 +519,9 @@ class MotorPanel:
     def apply(self):
         return cfg_command(self.motor, self.values())
 
+    def step(self):
+        return f"STEP {self.motor} {number(self.step_degrees.get()):.7g}"
+
     def go(self):
         return f"GO {self.motor} {int(self.units.get() == '% curso')} {number(self.target.get()):.7g}"
 
@@ -533,16 +567,19 @@ class MotorTab:
     def __init__(self, parent, send):
         self.send = send
         self.settings, warning = load_settings()
-        self.friction = dict.fromkeys(MOTORS, (0., 0.))
+        self.friction = dict.fromkeys(MOTORS, (0., 0., 0., 0.))
         try:
             data = json.loads(FRICTION_PATH.read_text(encoding="utf-8"))
             self.friction = {motor: tuple(map(float, data[str(motor)])) for motor in MOTORS}
-            if any(len(pair) != 2 or any(not 0 <= value <= 100 for value in pair) for pair in self.friction.values()):
+            if any(len(pair) not in (2, 4) or any(not 0 <= value <= 100 for value in pair)
+                   for pair in self.friction.values()):
                 raise ValueError("limiar inválido")
+            self.friction = {motor: (*pair, 0., 0.) if len(pair) == 2 else pair
+                             for motor, pair in self.friction.items()}
         except FileNotFoundError:
             pass
         except (OSError, ValueError, KeyError, TypeError) as error:
-            self.friction = dict.fromkeys(MOTORS, (0., 0.))
+            self.friction = dict.fromkeys(MOTORS, (0., 0., 0., 0.))
             warning = f"Falha ao carregar zona morta ({error})."
         self.configured = set()
         self.pending = {}
@@ -594,9 +631,10 @@ class MotorTab:
 
         plot_bar = ttk.Frame(parent)
         plot_bar.pack(fill="x", pady=(6, 0))
-        self.plot_mode = StringVar(value="Degrau +1°")
+        ttk.Button(plot_bar, text="Exportar motores CSV", command=self.export_samples).pack(side="right")
+        self.plot_mode = StringVar(value="Degrau")
         ttk.Combobox(plot_bar, textvariable=self.plot_mode, state="readonly", width=16,
-                     values=("Degrau +1°", "Movimento ao vivo", "PWM ao vivo")).pack(side="left")
+                     values=("Degrau", "Movimento ao vivo", "PWM ao vivo")).pack(side="left")
         self.plot_units = StringVar(value="Ângulo (°)")
         ttk.Combobox(plot_bar, textvariable=self.plot_units, state="readonly", width=12,
                      values=("Ângulo (°)", "Curso (%)")).pack(side="left", padx=(6, 0))
@@ -774,7 +812,7 @@ class MotorTab:
             if command == "LEVEL":
                 self.level_message.set("Aguardando confirmação do Pico")
         if command.startswith("STEP "):
-            self.plot_mode.set("Degrau +1°")
+            self.plot_mode.set("Degrau")
         elif command.startswith(("GO ", "WAVE ", "CIRCLE ")):
             self.plot_mode.set("Movimento ao vivo")
         self.send(command)
@@ -799,14 +837,16 @@ class MotorTab:
         return True
 
     def show_friction(self, motor):
-        forward, reverse = self.friction[motor]
-        values = (f"{value:.2f}%" if value else "a medir" for value in (forward, reverse))
-        plus, minus = values
-        self.panels[motor].pwm_saved.set(f"Compensação medida · Subir {plus} · Descer {minus}")
+        plus, minus, running_plus, running_minus = (
+            f"{value:.2f}%" if value else "a medir" for value in self.friction[motor]
+        )
+        self.panels[motor].pwm_saved.set(
+            f"Partida + {plus} · − {minus}  |  Sustentação + {running_plus} · − {running_minus}"
+        )
 
     def send_friction(self, motor):
-        forward, reverse = self.friction[motor]
-        self.send(f"FRICTION {motor} {forward:.2f} {reverse:.2f}")
+        values = " ".join(f"{value:.2f}" for value in self.friction[motor])
+        self.send(f"FRICTION {motor} {values}")
 
     def toggle_pwm(self, motor):
         if self.pwm_motor is not None:
@@ -824,7 +864,8 @@ class MotorTab:
         self.plot_mode.set("PWM ao vivo")
         panel.pwm_message.set("Aguardando confirmação do Pico")
         direction = 1 if panel.pwm_direction.get().endswith("(+)") else -1
-        self.send(f"PWMSTART {motor} {direction}")
+        command = f"PWMSTART {motor} {direction}"
+        self.send(command + " 1" if panel.pwm_sustain.get() else command)
         self.set_buttons()
 
     def finish_pwm(self, message, brake=False):
@@ -857,18 +898,20 @@ class MotorTab:
             return
         if motor != self.pwm_motor or not self.pwm_ack:
             return
-        if state == 2 and direction in (-1, 1) and 0 < duty <= 100:
-            self.pwm_results[motor] = (direction, duty)
-            self.finish_pwm(f"Saiu do repouso a {duty:.2f}% PWM · {'subida' if direction > 0 else 'descida'}")
+        if state in (2, 4) and direction in (-1, 1) and 0 < duty <= 100:
+            self.pwm_results[motor] = (direction, duty, state == 4)
+            result = "Sustentou movimento" if state == 4 else "Saiu do repouso"
+            self.finish_pwm(f"{result} a {duty:.2f}% PWM · {'subida' if direction > 0 else 'descida'}")
         elif state == 3:
             self.finish_pwm("Teste interrompido pelo Pico · confira o estado do motor")
 
     def use_pwm_result(self, motor):
         if not self.ready or self.pwm_motor is not None or motor not in self.pwm_results:
             return
-        direction, duty = self.pwm_results[motor]
-        forward, reverse = self.friction[motor]
-        values = {**self.friction, motor: (duty, reverse) if direction > 0 else (forward, duty)}
+        direction, duty, sustain = self.pwm_results[motor]
+        measured = list(self.friction[motor])
+        measured[2 * sustain + (direction < 0)] = duty
+        values = {**self.friction, motor: tuple(measured)}
         temporary = FRICTION_PATH.with_suffix(".tmp")
         try:
             temporary.write_text(json.dumps(values, indent=2) + "\n", encoding="utf-8")
@@ -960,7 +1003,10 @@ class MotorTab:
             if fields[1] == "PWMSTART" and self.pwm_motor is not None:
                 self.pwm_ack = True
                 self.pwm_next = 0
-                self.panels[self.pwm_motor].pwm_message.set("Suba em pequenos passos e aguarde o PWM aplicado")
+                panel = self.panels[self.pwm_motor]
+                panel.pwm_message.set("Inicie o movimento e reduza em passos, mantendo cada nível ≥ 300 ms"
+                                      if panel.pwm_sustain.get() else
+                                      "Suba em pequenos passos e aguarde o PWM aplicado")
                 self.set_buttons()
             if fields[1] == "IMUYAW":
                 self.imu_pending = None
@@ -1076,7 +1122,7 @@ class MotorTab:
             if step and step[0].step != sample.step:
                 step.clear()
             if not step and sample.elapsed > 0:
-                initial = sample.goal - 1
+                initial = sample.step_origin if sample.step_origin is not None else sample.goal - 1
                 step.append(sample._replace(elapsed=0, angle=initial, reference=initial))
             step.append(sample)
             self.step_result[motor] = "Em andamento"
@@ -1086,9 +1132,24 @@ class MotorTab:
             else:
                 self.step_result[motor] = "Interrompido"
 
+    def export_samples(self):
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as output:
+                writer = csv.writer(output)
+                writer.writerow(("motor", "pico_timestamp_us", "mode", "fault", "calibrated", "limits", "phase",
+                                 "endpoint", "angle_deg", "goal_deg", "reference_deg", "speed_deg_s", "span_deg",
+                                 "pwm_pct", "step", "elapsed_s", "enable", "fault_speed", "fault_threshold",
+                                 "speed_setpoint_deg_s", "step_origin_deg", "bridge_state"))
+                writer.writerows(sorted((*self.samples[1], *self.samples[3]), key=lambda row: row.timestamp))
+        except OSError as error:
+            self.message.set(f"Falha ao exportar CSV ({error})")
+
     def draw(self):
         plot_mode = self.plot_mode.get()
-        show_step = plot_mode == "Degrau +1°"
+        show_step = plot_mode == "Degrau"
         show_pwm = plot_mode == "PWM ao vivo"
         show_travel = self.plot_units.get() == "Curso (%)"
         for motor, axis in self.axes.items():

@@ -20,6 +20,7 @@ typedef struct {
 } TravelCalibration;
 
 void motors_init(void);
+void motors_disable_outputs(void);
 void motor_task(void *parameter);
 void motor_encoder_sample(unsigned motor, int64_t count, uint64_t sampled_at);
 void motor_imu_sample(float ax, float ay, float az, float gyro_norm, uint64_t sampled_at);

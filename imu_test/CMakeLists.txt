@@ -50,6 +50,10 @@ pico_enable_stdio_usb(imu_test 1)
 
 # Limit the time spent waiting for USB transmission during sampling.
 target_compile_definitions(imu_test PRIVATE PICO_STDIO_USB_STDOUT_TIMEOUT_US=2000)
+option(STEWART_FREERTOS_DIAGNOSTICS "Enable stack overflow and allocation failure hooks" OFF)
+if(STEWART_FREERTOS_DIAGNOSTICS)
+    target_compile_definitions(imu_test PRIVATE STEWART_FREERTOS_DIAGNOSTICS=1)
+endif()
 target_link_libraries(imu_test PRIVATE pico_stdlib hardware_i2c hardware_pio hardware_pwm
                        hardware_watchdog FreeRTOS-Kernel-Heap4 m)
 pico_generate_pio_header(imu_test ${CMAKE_CURRENT_LIST_DIR}/quadrature_encoder.pio)

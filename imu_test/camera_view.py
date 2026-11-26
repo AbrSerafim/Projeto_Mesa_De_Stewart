@@ -70,6 +70,8 @@ class CameraCapture:
     def __init__(self, index):
         self.index = index
         self.latest_sample = None
+        self.detector_feed = None
+        self.fps = 0.0
         self.error = ""
         self.photo_requested = Event()
         self.photo_result = ""
@@ -96,9 +98,21 @@ class CameraCapture:
             return
         camera, frame = stream
         photo_mode = False
+        previous_at = None
         try:
             while frame is not None and not self.stop.is_set():
-                self.latest_sample = (frame, monotonic())
+                at = monotonic()
+                self.latest_sample = (frame, at)
+                if previous_at is not None and at > previous_at:
+                    self.fps += .10 * (1 / (at - previous_at) - self.fps)
+                previous_at = at
+                feed = self.detector_feed
+                if feed is not None:
+                    detector, generation, crop, dimensions, settings = feed
+                    height, width = frame.shape[:2]
+                    if (width, height) == dimensions:
+                        start, end = crop or (0, width)
+                        detector.submit(frame[:, start:end], *settings, at, generation=generation)
                 if self.photo_requested.is_set():
                     if not photo_mode:
                         height, width = frame.shape[:2]
@@ -297,6 +311,7 @@ class CameraView:
         left.pack(side="left", fill="y")
         right.pack(side="right", fill="y")
         self.ball = BallControl(left, right, ball_toolbar, self.confidence)
+        self.ball.source = self.control_result
         threshold_slider.configure(command=self.change_confidence)
         self.confidence_label.set(f"{self.confidence.get():.0f}%")
         background = ttk.Style(parent).lookup("TFrame", "background") or "#f0f0f0"
@@ -412,9 +427,20 @@ class CameraView:
         self.raw_frame = self.vision_frame = None
         self.photo = self.rendered = None
 
+    def control_result(self):
+        detector = self.detector
+        if detector is not None and detector.loaded and not detector.error:
+            return detector.result
+        return None
+
     def clear_detection(self):
+        if self.capture is not None:
+            self.capture.detector_feed = None
         self.ball.stop("Autocorreção parada · detecção interrompida")
-        self.ball.frame_at = self.ball.observation = None
+        self.ball.frame_at = None
+        self.ball.yolo_fps = 0.0
+        if self.capture is None or self.capture.stop.is_set():
+            self.ball.camera_fps = 0.0
         self.submitted = self.shown_result = None
         self.detection_status.set("")
         self.canvas.delete("detection", "aruco", "disparity")
@@ -449,14 +475,16 @@ class CameraView:
         left, top, right, bottom = self.preview_bounds
         if not (left <= event.x < right and top <= event.y < bottom):
             return
+        self.ball.stop("Autocorreção parada · setpoint alterado")
         self.setpoint = ((event.x - left) / (right - left), (event.y - top) / (bottom - top))
+        self.ball.setpoint = self.setpoint
         self.setpoint_status.set(f"Setpoint na imagem · X {self.setpoint[0]:.1%} · Y {self.setpoint[1]:.1%}")
         self.clear_button.configure(state="normal")
         self.draw_setpoint()
 
     def clear_setpoint(self):
         self.ball.stop("Autocorreção parada · setpoint removido")
-        self.setpoint = None
+        self.setpoint = self.ball.setpoint = None
         self.canvas.delete("setpoint", "disparity")
         self.setpoint_status.set("Clique na imagem para marcar o setpoint")
         self.clear_button.configure(state="disabled")
@@ -559,8 +587,9 @@ class CameraView:
             self.class_box.configure(values=self.classes)
             if custom_model and self.classes:
                 self.custom_class.set(self.classes[0])
-        if latest is not self.submitted:
-            detector.submit(latest, class_name, aruco_enabled, self.confidence.get() / 100, captured_at)
+        settings = class_name, aruco_enabled, self.confidence.get() / 100
+        if self.capture.detector_feed is None:
+            self.capture.detector_feed = detector, detector.generation, self.crop, self.preview_dimensions, settings
             self.submitted = latest
         result = detector.result
         if result is not None and result.class_name == class_name and result.aruco_enabled == aruco_enabled:
@@ -622,14 +651,16 @@ class CameraView:
             result = self.shown_result if detector_ok else None
             if (result is None or now - result.captured_at > MAX_AGE) and self.canvas.find_withtag("disparity"):
                 self.canvas.delete("disparity")
-            self.ball.update(now, result, self.setpoint)
+            self.ball.camera_fps = capture.fps
+            self.ball.yolo_fps = self.detector.fps if detector_ok else 0.0
+            self.ball.update_preview(result, self.setpoint)
         elif self.submitted is not None:
             self.clear_detection()
             self.rendered = None
         self.parent.after(12, self.tick)
 
     def close(self):
-        self.ball.stop("Autocorreção encerrada")
+        self.ball.close()
         if self.capture is not None:
             self.capture.stop.set()
         if self.detector is not None:

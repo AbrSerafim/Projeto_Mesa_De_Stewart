@@ -82,6 +82,7 @@ class CameraDetector:
         self.error = ""
         self.aruco_error = ""
         self.result = None
+        self.fps = 0.0
         self.condition = Condition()
         self.generation = 0
         self.pending = None
@@ -89,8 +90,10 @@ class CameraDetector:
         self.thread = Thread(target=self.run, name="camera-detection", daemon=True)
         self.thread.start()
 
-    def submit(self, frame, class_name, aruco_enabled=False, confidence=.20, captured_at=None):
+    def submit(self, frame, class_name, aruco_enabled=False, confidence=.20, captured_at=None, generation=None):
         with self.condition:
+            if self.closed or (generation is not None and self.generation != generation):
+                return
             self.pending = (self.generation, frame, class_name, aruco_enabled, confidence,
                             monotonic() if captured_at is None else captured_at)
             self.condition.notify()
@@ -99,6 +102,7 @@ class CameraDetector:
         with self.condition:
             self.generation += 1
             self.pending = self.result = None
+            self.fps = 0.0
 
     def close(self):
         with self.condition:
@@ -109,6 +113,7 @@ class CameraDetector:
     def run(self):
         model = aruco_detector = None
         classes = {}
+        previous_at = previous_generation = None
         while True:
             with self.condition:
                 self.condition.wait_for(lambda: self.closed or self.pending is not None)
@@ -151,4 +156,8 @@ class CameraDetector:
                                      aruco_enabled, captured_at)
             with self.condition:
                 if not self.closed and generation == self.generation:
+                    completed = monotonic()
+                    if class_name is not None and not self.error and previous_generation == generation:
+                        self.fps += .2 * (1 / max(.001, completed - previous_at) - self.fps)
+                    previous_at, previous_generation = completed, generation
                     self.result = result

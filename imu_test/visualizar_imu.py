@@ -13,13 +13,14 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import serial
 from serial.tools import list_ports
+from ball_control import SEND_PERIOD
 from camera_view import CameraView
 from controle_motores import LEGACY_HELLOS, LOCAL_GRAVITY, PROTOCOL_HELLO, MotorTab, SerialSession
 
 
 HISTORY_SECONDS = 10
-LOG_PERIOD = 0.02
-LEGACY_LOG_PERIOD = 0.04
+LOG_PERIOD = 0.04
+LEGACY_FAST_LOG_PERIOD = 0.02
 MAX_LINE_BYTES = 512
 COLORS = ("tab:red", "tab:green", "tab:blue")
 BOARD = np.array([[-1, -0.65, 0], [1, -0.65, 0], [1, 0.65, 0], [-1, 0.65, 0]])
@@ -240,7 +241,7 @@ class MotorPlots:
         self.canvas.draw_idle()
 
 
-def visualize():
+def visualize(mock=False):
     window = tk.Tk()
     window.title("Telemetria do Pico")
     controls = ttk.Frame(window, padding=(8, 6))
@@ -314,6 +315,18 @@ def visualize():
     camera.ball.send = lambda command: session.send(command) if session else None
     camera.ball.prepare = lambda: camera.prepare_ball(prepare_ball)
 
+    def level_neutral():
+        if not drive.level_report or drive.level_report[0] != 5 or not drive.imu_ready:
+            return None
+        samples = tuple(drive.samples[motor] for motor in (1, 3))
+        if any(not stream or stream[-1].calibrated != 3 or stream[-1].span <= 0
+               or stream[-1].mode not in (0, 3) or stream[-1].fault for stream in samples):
+            return None
+        _, _, m1, m3 = drive.level_report
+        return tuple(100 * angle / stream[-1].span for angle, stream in zip((m1, m3), samples))
+
+    camera.ball.level_neutral = level_neutral
+
     def stop_motion(_event):
         camera.ball.stop("Autocorreção parada", send=False)
         if session is not None:
@@ -354,7 +367,11 @@ def visualize():
         if session is not None and session.device == device:
             return
         try:
-            new_port = serial.Serial(device, baudrate=115200, timeout=.01, write_timeout=.15)
+            if mock:
+                from pico_mock import PicoMock
+                new_port = PicoMock(telemetry=True)
+            else:
+                new_port = serial.Serial(device, baudrate=115200, timeout=.01, write_timeout=.15)
         except OSError as error:
             details = f"Erro ao abrir {device}: {error}"
             if session is not None:
@@ -364,13 +381,17 @@ def visualize():
 
         if session is not None:
             session.close()
-        session = SerialSession(new_port, SerialLines())
+        session = SerialSession(new_port, SerialLines(), ack_timeout=camera.ball.geometry.ack_timeout_s,
+                                ball_period=SEND_PERIOD)
         reset_stream()
         camera.ball.connected(monotonic())
         status.set(f"{session.device} — {message}")
 
     def show_ports():
         port_menu.delete(0, "end")
+        if mock:
+            port_menu.add_command(label="Pico simulada", command=lambda: connect("Pico simulada"))
+            return
         try:
             available = sorted(list_ports.comports())
         except OSError as error:
@@ -413,10 +434,10 @@ def visualize():
         samples = []
         motor_samples = []
         latest = None
-        for _ in range(len(session.ball_sent)):
-            camera.ball.record_sent(*session.ball_sent.popleft())
+        for _ in range(len(session.ball.events)):
+            camera.ball.record_event(session.ball.events.popleft())
         for _ in range(min(len(session.incoming), 512)):
-            line = session.incoming.popleft()
+            received_at, line = session.incoming.popleft()
             if line in (PROTOCOL_HELLO, *LEGACY_HELLOS[6:]) or line.startswith(b"accelx_mps2,"):
                 acceleration_si = True
             if line.startswith((b"@", b"!")):
@@ -427,7 +448,7 @@ def visualize():
                 camera.ball.receive(line)
                 motor_sample = drive.receive(line)
                 if motor_sample is not None:
-                    camera.ball.record_reference(now, motor_sample)
+                    camera.ball.record_reference(received_at, motor_sample)
             elif line.startswith(b"#"):
                 history.clear()
                 last_sample_at = None
@@ -457,7 +478,7 @@ def visualize():
 
         if motor_samples:
             previous = motor_history[-1][0] if motor_history else None
-            period = LOG_PERIOD if drive.fast_telemetry else LEGACY_LOG_PERIOD
+            period = LEGACY_FAST_LOG_PERIOD if drive.fast_telemetry and not drive.compatible else LOG_PERIOD
             times = batch_times(len(motor_samples), now, period, previous)
             motor_history.extend(zip(times, motor_samples))
         while motor_history and motor_history[0][0] < now - HISTORY_SECONDS:
@@ -479,7 +500,7 @@ def visualize():
                 panel.update(None, (None, None))
 
         if samples:
-            period = LOG_PERIOD if drive.fast_telemetry else LEGACY_LOG_PERIOD
+            period = LEGACY_FAST_LOG_PERIOD if drive.fast_telemetry and not drive.compatible else LOG_PERIOD
             if latest.motors is None:
                 period = 0.01
             times = batch_times(len(samples), now, period, last_sample_at)
@@ -536,16 +557,22 @@ def visualize():
     timer.add_callback(refresh)
     timer.start()
     canvas.draw_idle()
+    if mock:
+        window.after(0, lambda: connect("Pico simulada"))
     try:
         window.mainloop()
     finally:
         timer.stop()
         try:
+            camera.close()
+        finally:
             if session is not None:
                 session.close()
-        finally:
-            camera.close()
 
 
 if __name__ == "__main__":
-    visualize()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mock", action="store_true", help="Simula a Pico sem abrir porta f?sica")
+    visualize(parser.parse_args().mock)

@@ -1,29 +1,46 @@
 {
   "x": {
-    "mode": "PID",
+    "mode": "P",
     "kp": 100.0,
-    "ki": 20.0,
-    "kd": 10.0,
+    "ki": 0.0,
+    "kd": 0.0,
     "tf": 0.1,
-    "limit": 2.0,
+    "limit": 20.0,
     "invert": true,
     "course_min": 10.0,
     "course_max": 90.0,
     "pwm_max": 90.0,
-    "correction_min": 1.2
+    "correction_min": 0.0
   },
   "y": {
-    "mode": "PID",
+    "mode": "P",
     "kp": 100.0,
-    "ki": 20.0,
-    "kd": 10.0,
+    "ki": 0.0,
+    "kd": 0.0,
     "tf": 0.1,
-    "limit": 2.0,
+    "limit": 20.0,
     "invert": true,
     "course_min": 10.0,
     "course_max": 90.0,
     "pwm_max": 90.0,
-    "correction_min": 1.2
+    "correction_min": 0.0
   },
+  "matrix": [
+    [
+      0,
+      1
+    ],
+    [
+      1,
+      0
+    ]
+  ],
+  "neutral": [
+    40,
+    40
+  ],
+  "loss_timeout_s": 0.32,
+  "ack_timeout_s": 0.15,
+  "loss_behavior": "neutral_then_stop",
   "confidence": 0.4194520547945206
 }

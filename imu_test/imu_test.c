@@ -13,6 +13,7 @@
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
 #include "motor_control.h"
+#include "serial_framing.h"
 
 #define IMU_I2C i2c0
 #define IMU_SDA 4
@@ -22,7 +23,7 @@
 #define ENCODER_SPEED_WINDOW_MS 200u
 #define IMU_PERIOD_MS 20u
 #define STANDARD_GRAVITY_MPS2 9.80665f
-#define LOG_PERIOD_MS 20u
+#define LOG_PERIOD_MS 40u
 #define CALIBRATION_SAMPLES (2000u / IMU_PERIOD_MS)
 #define REFERENCE_SAMPLES (2000u / IMU_PERIOD_MS)
 
@@ -534,11 +535,19 @@ static void imu_task(void *parameter)
     }
 }
 
-static void log_telemetry(void)
+static void log_telemetry(uint64_t *snapshot_us, uint64_t *format_us, uint64_t *tx_us)
 {
+    const uint64_t began = time_us_64();
     critical_section_enter_blocking(&telemetry_lock);
     const Telemetry snapshot = telemetry;
     critical_section_exit(&telemetry_lock);
+
+    const unsigned limits = motor_limits();
+    TravelCalibration travel[MOTOR_COUNT];
+    for (uint motor = 0; motor < MOTOR_COUNT; ++motor) {
+        travel[motor] = motor_travel(motor);
+    }
+    const uint64_t snapshotted = time_us_64();
 
     char imu_csv[112] = ",,,,,,,,";
     if (snapshot.imu_state == IMU_READY) {
@@ -549,18 +558,16 @@ static void log_telemetry(void)
     }
     const EncoderReading m1 = snapshot.motor[MOTOR_1];
     const EncoderReading m3 = snapshot.motor[MOTOR_3];
-    const unsigned limits = motor_limits();
-    TravelCalibration travel[MOTOR_COUNT];
     char travel_csv[MOTOR_COUNT][12] = {{0}};
     for (uint motor = 0; motor < MOTOR_COUNT; ++motor) {
-        travel[motor] = motor_travel(motor);
         if (travel[motor].captured == LIMIT_BOTH) {
             snprintf(travel_csv[motor], sizeof travel_csv[motor], "%.2f",
                      travel_percent(&travel[motor], snapshot.motor[motor].count));
         }
     }
-    printf("%s,%" PRId64 ",%" PRIu64 ",%" PRIu64 ",%.4f,%.3f,"
-           "%" PRId64 ",%" PRIu64 ",%" PRIu64 ",%.4f,%.3f,%u,%u,%u,%u,%u,%u,%s,%u,%s\n",
+    char line[320];
+    snprintf(line, sizeof line, "%s,%" PRId64 ",%" PRIu64 ",%" PRIu64 ",%.4f,%.3f,"
+           "%" PRId64 ",%" PRIu64 ",%" PRIu64 ",%.4f,%.3f,%u,%u,%u,%u,%u,%u,%s,%u,%s",
            imu_csv, m1.count, m1.pulses_a, m1.pulses_b, m1.angle_deg, m1.rpm,
            m3.count, m3.pulses_a, m3.pulses_b, m3.angle_deg, m3.rpm,
            limits & 1u, (limits >> 1) & 1u,
@@ -568,16 +575,21 @@ static void log_telemetry(void)
            (unsigned)snapshot.imu_state,
            travel[MOTOR_1].captured, travel_csv[MOTOR_1],
            travel[MOTOR_3].captured, travel_csv[MOTOR_3]);
+    const uint64_t formatted = time_us_64();
+    puts(line);
+    *snapshot_us = snapshotted - began;
+    *format_us = formatted - snapshotted;
+    *tx_us = time_us_64() - formatted;
 }
 
 static void communication_task(void *parameter)
 {
     (void)parameter;
-    char line[192];
-    size_t length = 0;
-    bool discard = false;
+    SerialFrame frame = {0};
     bool connected = false;
-    uint64_t last_log = 0;
+    uint64_t last_log = 0, diagnostics_at = 0;
+    uint64_t snapshot_us = 0, format_us = 0, tx_us = 0, motor_publish_us = 0;
+    uint32_t rx_errors = 0, rx_commands = 0;
     TickType_t wake = xTaskGetTickCount();
     for (;;) {
         xTaskDelayUntil(&wake, pdMS_TO_TICKS(2));
@@ -586,8 +598,8 @@ static void communication_task(void *parameter)
                 motor_link_down();
             }
             connected = false;
-            length = 0;
-            discard = false;
+            frame.length = 0;
+            frame.discard = false;
             continue;
         }
         if (!connected) {
@@ -603,29 +615,57 @@ static void communication_task(void *parameter)
             if (c < 0) {
                 break;
             }
-            if (c == '\n') {
-                if (!discard && length != 0) {
-                    line[length] = '\0';
-                    motor_command(line);
-                }
-                length = 0;
-                discard = false;
-            } else if (c != '\r' && !discard) {
-                if (length == sizeof line - 1 || c < 32 || c > 126) {
-                    discard = true;
-                } else {
-                    line[length++] = (char)c;
-                }
+            const RxResult result = serial_frame_feed(&frame, c, time_us_64());
+            if (result == RX_COMMAND) {
+                ++rx_commands;
+                motor_command(frame.line);
+            } else if (result == RX_INVALID) {
+                ++rx_errors;
+                puts("!RXERR,frame");
             }
         }
+        const uint64_t began = time_us_64();
         motor_send_updates();
         const uint64_t now = time_us_64();
+        if (now - began > motor_publish_us) {
+            motor_publish_us = now - began;
+        }
+        if (now - diagnostics_at >= 1000000u) {
+            diagnostics_at = now;
+            printf("!COMMDIAG,%" PRIu32 ",%" PRIu32 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+                   ",%" PRIu64 ",%u\n", rx_errors, rx_commands, snapshot_us, format_us, tx_us,
+                   motor_publish_us, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+            motor_publish_us = 0;
+        }
         if (now - last_log >= LOG_PERIOD_MS * 1000u) {
             last_log = now;
-            log_telemetry();
+            log_telemetry(&snapshot_us, &format_us, &tx_us);
         }
     }
 }
+
+#ifdef STEWART_FREERTOS_DIAGNOSTICS
+static void reboot_on_rtos_failure(void)
+{
+    motors_disable_outputs();
+    watchdog_reboot(0, 0, 0);
+    for (;;) {
+        tight_loop_contents();
+    }
+}
+
+void vApplicationMallocFailedHook(void)
+{
+    reboot_on_rtos_failure();
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t task, char *name)
+{
+    (void)task;
+    (void)name;
+    reboot_on_rtos_failure();
+}
+#endif
 
 int main(void)
 {
