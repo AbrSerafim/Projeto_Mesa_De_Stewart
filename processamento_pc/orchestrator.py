@@ -19,12 +19,6 @@ PORT = "COM5"
 BAUDRATE = 115200
 TIMEOUT = 1
 
-lengths_1 = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-ang_1 = 0.0
-
-lengths_3 = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-ang_3 = 0.0
-
 # ==========================
 # Functions & classes
 # ==========================
@@ -42,10 +36,10 @@ ppy.setup(model_path=MODEL_PATH, camera_id=CAMERA_ID)
 x_to_theta = Table_ball_model(J=1.390e-3, R=12.46e-2, m=63.95e-3, g=9.81, ang=0, Ta=20e-3)
 y_to_psi   = Table_ball_model(J=1.390e-3, R=12.46e-2, m=63.95e-3, g=9.81, ang=0, Ta=20e-3)
 
-theta_to_ang3 = Motor_table_model(lengths=lengths_3, ang=ang_3, test=True) 
-psi_to_ang1   = Motor_table_model(lengths=lengths_1, ang=ang_1, test=True)
+theta_to_ang3 = Motor_table_model() 
+psi_to_ang1   = Motor_table_model()
 
-com = Com(port=PORT, baudrate=BAUDRATE, timeout=TIMEOUT)
+#com = Com(port=PORT, baudrate=BAUDRATE, timeout=TIMEOUT)
 
 k = 0
 while True:
@@ -71,8 +65,8 @@ while True:
     # Position to table angle
     # -------------------------------
 
-    x_to_theta.update(pos=-xc, k=k)
-    y_to_psi.update(pos=-yc,k=k)
+    x_to_theta.update(pos=xc, k=k)
+    y_to_psi.update(pos=yc,k=k)
 
     # -------------------------------
     # Table angle to motor angle
@@ -84,7 +78,6 @@ while True:
     # -------------------------------
     # Send motor angles to pico
     # -------------------------------
-    print(psi_to_ang1.theta_1, theta_to_ang3.theta_1)
-    com.send(ang_1=psi_to_ang1.theta_1, ang_3=theta_to_ang3.theta_1)
+    #com.send(ang_1=psi_to_ang1.theta_1, ang_3=theta_to_ang3.theta_1)
 
     k+=1

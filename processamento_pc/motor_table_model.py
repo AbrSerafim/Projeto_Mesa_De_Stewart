@@ -5,7 +5,7 @@ from math import pi
 
 class Motor_table_model():
     """ Class to handle the motor to table model params """
-    def __init__(self, lengths: list[float], ang: float,  theta_0: float = pi, theta_1: float = 0.0, test: bool = False) -> None:
+    def __init__(self, lengths: list[float] = [103.03e-3, 27.20e-3, 68.75e-3, 18.00e-3, 65.00e-3, 81.00e-3], ang: float = 1.40/180*pi,  theta_0: float = pi/2, theta_1: float = 0.0, test: bool = False) -> None:
 
         if len(lengths) != 6:
             raise ValueError("Expected 6 linkage lengths")
@@ -49,7 +49,7 @@ class Motor_table_model():
 
         self.R = (
             +self.l**2 + self.l1**2 - self.l2**2 + self.l3**2 + self.l4**2 - 2*self.l3*self.l5 +
-            -2*self.l*self.l3*self.cos*np.cos(self.theta_0)-2*self.l*self.l4*self.cos*np.sin(self.theta_0) +
+            -2*self.l*self.l3*self.cos*np.cos(self.theta_0) - 2*self.l*self.l4*self.cos*np.sin(self.theta_0) +
             +2*self.l*self.l5*self.cos*np.cos(self.theta_0) - 2*self.l*self.l3*self.sin*np.sin(self.theta_0) +
             +2*self.l*self.l4*self.sin*np.cos(self.theta_0) + 2*self.l*self.l5*self.sin*np.sin(self.theta_0)
         )
@@ -57,10 +57,10 @@ class Motor_table_model():
     def solve_theta_1(self, tol: float=1e-9) -> float:
         """ Solve inverse kinematics for valid theta values """
 
-        #if self.test_mode:
-        #    return self.theta_1
+        if self.test_mode:
+            return self.theta_1
 
-        d = self.Q**2 + self.P**2 - self.R**2
+        d = self.Q**2 - self.P**2 + self.R**2
 
         if d < -tol:
             raise ValueError("Impossible to solve, imaginary roots")
@@ -78,4 +78,6 @@ class Motor_table_model():
 
 
 if __name__ == "__main__":
-    pass
+    model = Motor_table_model()
+    print(model.theta_0)
+    print(model.solve_theta_1())
