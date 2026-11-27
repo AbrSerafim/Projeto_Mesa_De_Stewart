@@ -98,7 +98,7 @@ static QueueHandle_t g_telemetry_queue;
 static volatile int32_t g_encoder_count = 0;
 
 /* -------------------------------------------------------------------------- */
-/* Saida PWM bidirecional e acionamento do motor.                               */
+/* Saida PWM bidirecional e acionamento do motor.                             */
 /* -------------------------------------------------------------------------- */
 
 static void motor_set_signed_duty_percent(float duty_percent)

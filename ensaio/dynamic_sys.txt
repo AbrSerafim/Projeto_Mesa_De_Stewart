@@ -1,12 +1,20 @@
-Metal:
+Metal Pequena:
     R = 12.61cm
     M = 8.27g
-    J = 5.26e-5kgm^2
+    J_G = 5.26e-5kgm^2
+    J_O = 1.841e-4kgm^2
+    m = 2/5
+Metal Grande:
+    R = 12.46cm 
+    M = 63.95g
+    J_G = 3.9713e-4kgm^2
+    J_O = 1.390e-3kgm^2
     m = 2/5
 Laranja:
     R = 39.20cm
     M = 2.79g
-    J = 2.86e-4kgm^2
+    J_G = 2.86e-4kgm^2
+    J_O = 7.1472e-4kgm^2
     m = 2/3
 
 a_G = (R^2 * P * S_phi(t)) / (4 * J_G + 2 * R^2 * m)
